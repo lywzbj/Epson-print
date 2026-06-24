@@ -1,5 +1,7 @@
 package org.example.demo;
 
+import org.example.config.PageLayout;
+import org.example.config.PrintConfig;
 import org.example.connection.FileStreamConnection;
 import org.example.connection.PrinterConnection;
 import org.example.connection.SocketConnection;
@@ -39,6 +41,12 @@ public class PrinterDemo {
             return;
         }
 
+        // ---- A5 横版 2-up 拼合打印演示 ----
+        if (args.length >= 1 && "a5layout".equalsIgnoreCase(args[0])) {
+            runA5LayoutDemo(args);
+            return;
+        }
+
         // ---- 默认演示模式 ----
         System.out.println("==========================================");
         System.out.println("  EPSON DLQ-3500K 打印机功能演示");
@@ -56,6 +64,7 @@ public class PrinterDemo {
             demo.demo_chineseText();
             demo.demo_bitImage();
             demo.demo_pageControl();
+            demo.demo_a5TwoUpOnA4();
 
             System.out.println("\n全部演示完成！");
 
@@ -73,16 +82,23 @@ public class PrinterDemo {
 
     /**
      * Word 文档打印模式。
-     * 语法：word <file.docx> [--pages=P] [--lines=L1-L2] [--skip-empty] [--skip-marker=M] [--lpp=N]
+     * 语法：word <file.docx> [--pages=P] [--lines=L1-L2] [--skip-empty] [--skip-marker=M] [--lpp=N] [--a5-2up]
+     *
+     * --a5-2up: 启用 A5 横版 2-up 拼合模式，将 2 页 Word 内容横向打印到 1 张 A4 纸。
+     *            配合 --pages=P1-P2 指定源文档页码范围（默认打印全部，按逻辑页切分）。
+     *            配合 --lines=L1-L2 按行范围选取后切分到逻辑页。
      */
     private static void runWordPrint(String[] args) {
         String filePath = args[1];
         PrintSelector selector = new PrintSelector();
+        boolean a5TwoUpMode = false;
 
         // 解析参数
         for (int i = 2; i < args.length; i++) {
             String arg = args[i];
-            if (arg.startsWith("--pages=")) {
+            if ("--a5-2up".equals(arg)) {
+                a5TwoUpMode = true;
+            } else if (arg.startsWith("--pages=")) {
                 selector.pageRange(arg.substring("--pages=".length()));
             } else if (arg.startsWith("--lines=")) {
                 String range = arg.substring("--lines=".length());
@@ -113,11 +129,32 @@ public class PrinterDemo {
         // 创建连接
         PrinterConnection connection = createConnection(args);
         PrinterService printer = new PrinterService(connection);
-        PrinterDemo demo = new PrinterDemo(printer);
 
         try {
             printer.open();
-            demo.demo_wordDocument(filePath, selector);
+
+            if (a5TwoUpMode) {
+                // ---- A5 横版 2-up 拼合模式 ----
+                System.out.println("\n=== A5 横版 2-up 拼合打印 ===");
+                System.out.println("  源文件: " + filePath);
+
+                PrintConfig config = PrintConfig.a4TwoA5Landscape();
+                System.out.println("  配置: " + config);
+
+                WordDocument doc = WordDocument.load(filePath);
+                System.out.println("  文档: " + doc.getParagraphCount() + " 段落, 约 " + doc.getTotalPages() + " 页");
+                System.out.println("  每逻辑页: " + config.effectivePageLines() + " 行 (A5 横版)");
+                System.out.println("  每物理纸: " + config.getPageLayout().pagesPerSheet() + " 逻辑页 (A4)");
+
+                WordPrinter wordPrinter = new WordPrinter(printer);
+                wordPrinter.printWithConfig(doc, selector, config);
+
+                System.out.println("=== A5 2-up 打印完成 ===");
+            } else {
+                // ---- 普通 Word 打印模式 ----
+                PrinterDemo demo = new PrinterDemo(printer);
+                demo.demo_wordDocument(filePath, selector);
+            }
         } catch (IOException e) {
             System.err.println("打印出错: " + e.getMessage());
         } finally {
@@ -322,6 +359,38 @@ public class PrinterDemo {
         printer.setLineSpacing1_6();
     }
 
+    /**
+     * A5 横版 2-up 拼合打印演示入口。
+     * 语法：a5layout [连接参数...]
+     */
+    private static void runA5LayoutDemo(String[] args) {
+        System.out.println("==========================================");
+        System.out.println("  A5 横版 2-up 拼合打印演示");
+        System.out.println("  2 页 A5 横向 → 1 张 A4 纸");
+        System.out.println("==========================================");
+
+        // 跳过 "a5layout" 参数，将剩余参数传给 createConnection
+        String[] connArgs = new String[args.length - 1];
+        System.arraycopy(args, 1, connArgs, 0, connArgs.length);
+
+        PrinterConnection connection = createConnection(connArgs);
+        PrinterService printer = new PrinterService(connection);
+        PrinterDemo demo = new PrinterDemo(printer);
+
+        try {
+            printer.open();
+            demo.demo_a5TwoUpOnA4();
+            System.out.println("\nA5 2-up 演示完成！");
+        } catch (IOException e) {
+            System.err.println("打印出错: " + e.getMessage());
+        } finally {
+            try {
+                printer.close();
+            } catch (IOException ignored) {
+            }
+        }
+    }
+
     // ================================================================
     // 演示 5：页格式控制
     // ================================================================
@@ -356,6 +425,136 @@ public class PrinterDemo {
 
         printer.printText("--- End of Page Control Demo ---");
         printer.feedLines(2);
+    }
+
+    // ================================================================
+    // 演示 5b：A5 横版 2-up 拼合打印 (A4 纸)
+    // ================================================================
+
+    /**
+     * 演示：2 页 A5 横版内容拼合打印到 1 张 A4 纸上。
+     *
+     * <p>布局说明：
+     * <ul>
+     *   <li>物理纸：A4 竖版 (210 × 297 mm)</li>
+     *   <li>逻辑页：A5 横版 (210 × 148 mm)，每页约 35 行</li>
+     *   <li>排列：上下垂直排列，第 1 页在上半部，第 2 页在下半部</li>
+     * </ul>
+     *
+     * <p>打印流程：
+     * <ol>
+     *   <li>构建 PrintConfig (a4TwoA5Landscape 预设)</li>
+     *   <li>应用配置到打印机</li>
+     *   <li>使用 printWithConfig() 自动处理布局</li>
+     *   <li>或手动控制 beginPhysicalSheet / beginLogicalPage / endLogicalPage</li>
+     * </ol>
+     */
+    public void demo_a5TwoUpOnA4() throws IOException {
+        System.out.println("\n--- 演示 5b: A5 横版 2-up 拼合打印 (A4 纸) ---");
+
+        // ----------------------------------------------------------
+        // 方式 1：使用便捷方法 printWithConfig() — 推荐
+        // ----------------------------------------------------------
+        System.out.println("  [方式 1] 使用 printWithConfig() 自动布局");
+
+        PrintConfig config = PrintConfig.a4TwoA5Landscape();
+        System.out.println("  配置: " + config);
+
+        // 应用配置
+        printer.applyConfig(config);
+        System.out.println("  ✓ 已应用打印配置");
+
+        // 准备 2 页 A5 内容，自动拼合到 1 张 A4
+        printer.printWithConfig(config,
+                "A5 Page 1 (Top): This is the first logical page."
+                        + " It occupies the upper half of the A4 sheet."
+                        + " A5 landscape = 210 x 148 mm.",
+                "A5 Page 2 (Bottom): This is the second logical page."
+                        + " It occupies the lower half of the A4 sheet."
+                        + " Both pages fit on one A4 sheet."
+        );
+        System.out.println("  ✓ 已发送 2 页 A5 内容 → 1 张 A4 纸");
+
+        printer.feedLines(2);
+
+        // ----------------------------------------------------------
+        // 方式 2：手动控制物理页/逻辑页 — 更灵活
+        // ----------------------------------------------------------
+        System.out.println("  [方式 2] 手动控制 begin/end 物理页和逻辑页");
+
+        PrintConfig config2 = PrintConfig.builder()
+                .physicalPaper(org.example.config.PaperSize.A4)
+                .pageLayout(PageLayout.a4_twoA5LandscapeVertical())
+                .cpi(10)
+                .bold(true)
+                .leftMargin(2)
+                .build();
+        printer.applyConfig(config2);
+
+        // 手动控制
+        printer.beginPhysicalSheet(config2);
+
+        // -- 第 1 逻辑页 (上半部分) --
+        printer.beginLogicalPage(config2, 0);
+        printer.printText("[Manual - Page 1/2] Top half of A4 sheet.");
+        printer.printText("This demonstrates manual control over");
+        printer.printText("the physical sheet and logical pages.");
+        printer.printText("You can print anything here: text, Chinese, bit images...");
+        printer.endLogicalPage(config2, 0, false);
+
+        // -- 第 2 逻辑页 (下半部分) --
+        printer.beginLogicalPage(config2, 1);
+        printer.printText("[Manual - Page 2/2] Bottom half of A4 sheet.");
+        printer.printText("The printer automatically positions");
+        printer.printText("the second logical page below the first.");
+        printer.printText("ESC/P-K commands handle the spacing.");
+        printer.endLogicalPage(config2, 1, true);
+
+        printer.endPhysicalSheet();
+        System.out.println("  ✓ 手动模式完成");
+
+        // ----------------------------------------------------------
+        // 方式 3：汉字内容 + 2-up 布局
+        // ----------------------------------------------------------
+        printer.feedLines(1);
+        System.out.println("  [方式 3] 汉字内容 + 2-up 布局");
+
+        PrintConfig config3 = PrintConfig.builder()
+                .physicalPaper(org.example.config.PaperSize.A4)
+                .pageLayout(PageLayout.a4_twoA5LandscapeVertical())
+                .cpi(10)
+                .chineseFont(PrintConfig.ChineseFont.SONG_TI)
+                .chineseCharSize(1, 1)
+                .build();
+        printer.applyConfig(config3);
+
+        printer.beginPhysicalSheet(config3);
+
+        // 第 1 逻辑页 — 汉字
+        printer.beginLogicalPage(config3, 0);
+        printer.bold(true);
+        printer.printChinese("【第 1 页】A5 横版 — 汉字测试");
+        printer.bold(false);
+        printer.printChinese("春眠不觉晓，处处闻啼鸟。");
+        printer.printChinese("夜来风雨声，花落知多少。");
+        printer.printChinese("这是 A4 纸的上半部分 (A5 横版第 1 页)。");
+        printer.endLogicalPage(config3, 0, false);
+
+        // 第 2 逻辑页 — 汉字
+        printer.beginLogicalPage(config3, 1);
+        printer.bold(true);
+        printer.printChinese("【第 2 页】A5 横版 — 汉字测试");
+        printer.bold(false);
+        printer.printChinese("白日依山尽，黄河入海流。");
+        printer.printChinese("欲穷千里目，更上一层楼。");
+        printer.printChinese("这是 A4 纸的下半部分 (A5 横版第 2 页)。");
+        printer.endLogicalPage(config3, 1, true);
+
+        printer.endPhysicalSheet();
+        System.out.println("  ✓ 汉字 2-up 模式完成");
+
+        printer.feedLines(2);
+        System.out.println("  === A5 2-up 拼合打印全部演示完成 ===");
     }
 
     // ================================================================

@@ -1,9 +1,11 @@
 package org.example.word;
 
 import org.example.command.EscpCommand;
+import org.example.config.PrintConfig;
 import org.example.service.PrinterService;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -261,6 +263,152 @@ public class WordPrinter {
         currentUnderline = false;
         currentFont = null;
         currentFontSize = 0;
+    }
+
+    // ================================================================
+    // 基于 PrintConfig 的多页拼合打印 (N-up)
+    // ================================================================
+
+    /**
+     * 使用 PrintConfig 打印 Word 文档，自动处理 N-up 拼合布局。
+     *
+     * <p>典型场景 — 2 页 A5 横版打到 1 张 A4 纸：
+     * <pre>
+     *   PrintConfig config = PrintConfig.a4TwoA5Landscape();
+     *   WordDocument doc = WordDocument.load("test.docx");
+     *   PrintSelector selector = new PrintSelector().pageRange("1-2");
+     *
+     *   WordPrinter wp = new WordPrinter(printer);
+     *   wp.printWithConfig(doc, selector, config);
+     * </pre>
+     *
+     * <p>工作原理：
+     * <ol>
+     *   <li>应用 PrintConfig 设置（CPI、行间距、边距等）</li>
+     *   <li>由 selector 筛选要打印的段落</li>
+     *   <li>按 effectivePageLines() 将段落切成逻辑页</li>
+     *   <li>每 pagesPerSheet 个逻辑页组成一张物理纸</li>
+     *   <li>自动调用 beginPhysicalSheet / beginLogicalPage / endLogicalPage</li>
+     * </ol>
+     *
+     * @param doc      已加载的 Word 文档
+     * @param selector 行选择规则（为 null 时打印全部，页码过滤按 config 页长重新计算）
+     * @param config   打印配置（含页面布局、纸张、边距等）
+     */
+    public void printWithConfig(WordDocument doc, PrintSelector selector, PrintConfig config) throws IOException {
+        long startTime = System.currentTimeMillis();
+
+        // 1. 获取有效行/页参数
+        int logicalPageLines = config.effectivePageLines();
+        int pagesPerSheet = config.getPageLayout().pagesPerSheet();
+        boolean isMultiUp = config.getPageLayout().isMultiUp();
+
+        // 更新 selector 的每页行数（用于页码范围计算）
+        if (selector != null) {
+            selector.linesPerPage(logicalPageLines);
+            log("文档: " + doc.getFilePath());
+            log("布局: " + config.getPageLayout());
+            log("每逻辑页: " + logicalPageLines + " 行 | 每物理纸: " + pagesPerSheet + " 逻辑页");
+            log("规则: " + selector);
+        } else {
+            log("文档: " + doc.getFilePath() + " (打印全部)");
+            log("布局: " + config.getPageLayout());
+        }
+
+        // 2. 应用配置
+        printer.applyConfig(config);
+        resetFormatState();
+
+        // 3. 收集需打印的段落
+        List<WordDocument.WordParagraph> paragraphs = doc.getAllParagraphs();
+        List<WordDocument.WordParagraph> selected = new ArrayList<>();
+        for (int i = 0; i < paragraphs.size(); i++) {
+            int lineNumber = i + 1;
+            WordDocument.WordParagraph wp = paragraphs.get(i);
+            if (selector == null || selector.shouldPrint(lineNumber, wp.getText())) {
+                selected.add(wp);
+            }
+        }
+
+        if (selected.isEmpty()) {
+            log("没有可打印的内容（选择器过滤后为空）");
+            return;
+        }
+
+        // 4. 按逻辑页行数切分
+        int totalLogicalPages = (int) Math.ceil((double) selected.size() / logicalPageLines);
+        log(String.format("共 %d 逻辑页 / %d 张物理纸",
+                totalLogicalPages,
+                (int) Math.ceil((double) totalLogicalPages / pagesPerSheet)));
+
+        int physicalSheetCount = 0;
+
+        for (int logicalPageIdx = 0; logicalPageIdx < totalLogicalPages; logicalPageIdx++) {
+            int posInSheet = logicalPageIdx % pagesPerSheet;
+
+            // 开始一张新物理纸
+            if (posInSheet == 0) {
+                if (logicalPageIdx > 0) {
+                    // 上一张物理纸收尾
+                    endPhysicalSheetForConfig(config, pagesPerSheet - 1, true);
+                    printer.feedLines(1);
+                }
+                physicalSheetCount++;
+                log(String.format("--- 物理纸 #%d ---", physicalSheetCount));
+                printer.beginPhysicalSheet(config);
+            }
+
+            // 开始逻辑页
+            printer.beginLogicalPage(config, posInSheet);
+            log(String.format("  逻辑页 %d/%d (纸上位置 %d/%d)",
+                    logicalPageIdx + 1, totalLogicalPages,
+                    posInSheet + 1, pagesPerSheet));
+
+            // 打印该逻辑页的段落
+            int startLine = logicalPageIdx * logicalPageLines;
+            int endLine = Math.min(startLine + logicalPageLines, selected.size());
+
+            for (int j = startLine; j < endLine; j++) {
+                WordDocument.WordParagraph wp = selected.get(j);
+                printParagraph(wp);
+            }
+
+            // 逻辑页内容不够填满时，补空行
+            int printed = endLine - startLine;
+            if (printed < logicalPageLines) {
+                int fill = logicalPageLines - printed;
+                for (int f = 0; f < Math.min(fill, 3); f++) {
+                    printer.feedLines(1);
+                }
+            }
+
+            // 结束逻辑页
+            boolean isLastOnSheet = (posInSheet == pagesPerSheet - 1);
+            boolean isLastOverall = (logicalPageIdx == totalLogicalPages - 1);
+
+            if (isLastOverall) {
+                endPhysicalSheetForConfig(config, posInSheet, true);
+            } else if (isLastOnSheet) {
+                endPhysicalSheetForConfig(config, posInSheet, true);
+            } else {
+                printer.endLogicalPage(config, posInSheet, false);
+            }
+        }
+
+        // 5. 收尾
+        printer.feedLines(2);
+        log("------------------------------");
+        log(String.format("完成: %d 段落 → %d 逻辑页 → %d 张物理纸",
+                selected.size(), totalLogicalPages, physicalSheetCount));
+        log(String.format("耗时: %dms", System.currentTimeMillis() - startTime));
+    }
+
+    /**
+     * 结束一张物理纸（含最后一个逻辑页的收尾）。
+     */
+    private void endPhysicalSheetForConfig(PrintConfig config, int lastPageIndex, boolean isLast) throws IOException {
+        printer.endLogicalPage(config, lastPageIndex, isLast);
+        printer.endPhysicalSheet();
     }
 
     /** 日志输出 */
