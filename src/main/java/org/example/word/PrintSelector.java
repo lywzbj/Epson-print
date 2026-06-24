@@ -1,5 +1,7 @@
 package org.example.word;
 
+import org.example.word.WordDocument.WordParagraph;
+
 import java.util.*;
 
 /**
@@ -35,6 +37,14 @@ public class PrintSelector {
     private boolean skipEmptyLines = false;
     private final Set<String> skipMarkers = new LinkedHashSet<>();
     private final Set<Integer> skipLineNumbers = new LinkedHashSet<>();
+    private final Set<Integer> selectLineNumbers = new LinkedHashSet<>();  // 白名单：只打印这些行
+
+    // 表格过滤
+    private boolean skipNonTable = false;       // 只打印表格行
+    private int targetTableIndex = -1;          // 目标表格序号 (-1=不限)
+    private int targetTableRow = 0;             // 目标表格行号 (1-based, 0=不限)
+    private int targetTableRowEnd = 0;          // 目标表格行结束号 (>=targetTableRow 时表示范围)
+    private boolean tableBorder = true;         // 是否保留表格边框 (false=去掉 " | " 分隔符)
 
     // ======== 构建方法 (链式) ========
 
@@ -115,11 +125,79 @@ public class PrintSelector {
         return this;
     }
 
-    /** 跳过指定行号 */
+    /** 跳过指定行号（全局，黑名单） */
     public PrintSelector skipLines(int... lineNumbers) {
         for (int n : lineNumbers) {
             this.skipLineNumbers.add(n);
         }
+        return this;
+    }
+
+    /**
+     * 只打印指定行号（全局，白名单）。
+     * 设置后 lineRange 失效，只打印白名单中的行。
+     * 可与 skipLines 叠加：白名单中的行如果也在 skipLines 中，仍被跳过。
+     *
+     * <p>示例：
+     * <pre>
+     *   // 只打印第 1, 3, 5, 7 行
+     *   new PrintSelector().selectLines(1, 3, 5, 7);
+     *
+     *   // 打印第 1~100 行中除 2,4,6 的所有行（白名单+黑名单组合）
+     *   new PrintSelector().selectLines(1, 2, 3, 4, 5, 6).skipLines(2, 4, 6);
+     * </pre>
+     */
+    public PrintSelector selectLines(int... lineNumbers) {
+        for (int n : lineNumbers) {
+            this.selectLineNumbers.add(n);
+        }
+        return this;
+    }
+
+    // -- 表格过滤 --
+
+    /**
+     * 跳过所有非表格行，只打印表格内容。
+     */
+    public PrintSelector skipNonTable(boolean skip) {
+        this.skipNonTable = skip;
+        return this;
+    }
+
+    /**
+     * 只打印指定表格的指定行。
+     * @param tableIndex 表格序号 (0-based，Word 文档中第几个表格)
+     * @param rowInTable 表格内行号 (1-based)
+     */
+    public PrintSelector tableRow(int tableIndex, int rowInTable) {
+        this.targetTableIndex = tableIndex;
+        this.targetTableRow = rowInTable;
+        this.targetTableRowEnd = 0;
+        return this;
+    }
+
+    /**
+     * 只打印指定表格的行范围（多行）。
+     * @param tableIndex 表格序号 (0-based)
+     * @param fromRow    起始行号 (1-based, 含)
+     * @param toRow      结束行号 (1-based, 含)
+     */
+    public PrintSelector tableRows(int tableIndex, int fromRow, int toRow) {
+        this.targetTableIndex = tableIndex;
+        this.targetTableRow = fromRow;
+        this.targetTableRowEnd = toRow;
+        return this;
+    }
+
+    /**
+     * 是否保留表格单元格之间的 " | " 分隔符。
+     * <ul>
+     *   <li>{@code tableBorder(true)}  — 保留边框（默认），如 "张三 | 25 | 研发部"</li>
+     *   <li>{@code tableBorder(false)} — 去掉边框，如 "张三 25 研发部"</li>
+     * </ul>
+     */
+    public PrintSelector tableBorder(boolean on) {
+        this.tableBorder = on;
         return this;
     }
 
@@ -138,9 +216,13 @@ public class PrintSelector {
             if (!selectedPages.contains(page)) return false;
         }
 
-        // 行范围过滤
-        if (lineStart > 0 && lineNumber < lineStart) return false;
-        if (lineEnd > 0 && lineNumber > lineEnd) return false;
+        // 行范围过滤（白名单优先，有白名单时行范围无效）
+        if (!selectLineNumbers.isEmpty()) {
+            if (!selectLineNumbers.contains(lineNumber)) return false;
+        } else {
+            if (lineStart > 0 && lineNumber < lineStart) return false;
+            if (lineEnd > 0 && lineNumber > lineEnd) return false;
+        }
 
         // 跳过空行
         if (skipEmptyLines && (text == null || text.trim().isEmpty())) return false;
@@ -156,6 +238,47 @@ public class PrintSelector {
         if (skipLineNumbers.contains(lineNumber)) return false;
 
         return true;
+    }
+
+    /**
+     * 判断某一行是否应该被打印（含表格过滤）。
+     * WordPrinter 调用此方法，可获取 WordParagraph 的表格来源信息。
+     */
+    public boolean accept(int lineNumber, WordParagraph wp) {
+        // 先走基础文本过滤
+        if (!shouldPrint(lineNumber, wp.getText())) return false;
+
+        // 只打印表格行
+        if (skipNonTable && !wp.isTableRow()) return false;
+
+        // 指定表格 + 行号 (单行或范围)
+        if (targetTableIndex >= 0 && targetTableRow > 0) {
+            if (wp.getTableIndex() != targetTableIndex) return false;
+            int row = wp.getRowInTable();
+            if (targetTableRowEnd >= targetTableRow) {
+                // 范围匹配
+                if (row < targetTableRow || row > targetTableRowEnd) return false;
+            } else {
+                // 单行匹配
+                if (row != targetTableRow) return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * 对表格行文本进行格式化转换。
+     * 当 tableBorder=false 时，去掉 " | " 分隔符，各单元格用空格分隔。
+     *
+     * @param wp  段落对象
+     * @return 格式化后的文本（非表格行原样返回）
+     */
+    public String formatTableText(WordParagraph wp) {
+        if (!tableBorder && wp.isTableRow()) {
+            return wp.getText().replace(" | ", "  ");
+        }
+        return wp.getText();
     }
 
     /**
@@ -176,23 +299,37 @@ public class PrintSelector {
     public boolean hasLineFilter() { return lineStart > 0 || lineEnd > 0; }
     public boolean hasAnyFilter() {
         return hasPageFilter() || hasLineFilter() || skipEmptyLines
-                || !skipMarkers.isEmpty() || !skipLineNumbers.isEmpty();
+                || skipNonTable || targetTableIndex >= 0 || targetTableRow > 0
+                || !skipMarkers.isEmpty() || !skipLineNumbers.isEmpty()
+                || !selectLineNumbers.isEmpty();
     }
 
     public Set<Integer> selectedPages() { return Collections.unmodifiableSet(selectedPages); }
     public int lineStart() { return lineStart; }
     public int lineEnd() { return lineEnd; }
     public int linesPerPage() { return linesPerPage; }
+    public boolean isTableBorder() { return tableBorder; }
 
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder("PrintSelector[");
         if (!selectedPages.isEmpty()) sb.append("pages=").append(selectedPages).append(", ");
-        if (lineStart > 0 || lineEnd > 0) sb.append("lines=").append(lineStart).append("-").append(lineEnd).append(", ");
+        if (!selectLineNumbers.isEmpty()) sb.append("selectLines=").append(selectLineNumbers).append(", ");
+        else if (lineStart > 0 || lineEnd > 0) sb.append("lines=").append(lineStart).append("-").append(lineEnd).append(", ");
         if (skipEmptyLines) sb.append("skipEmpty, ");
+        if (skipNonTable) sb.append("skipNonTable, ");
+        if (targetTableIndex >= 0) sb.append("table=#").append(targetTableIndex).append(", ");
+        if (targetTableRow > 0) {
+            if (targetTableRowEnd >= targetTableRow) {
+                sb.append("rowsInTable=").append(targetTableRow).append("-").append(targetTableRowEnd).append(", ");
+            } else {
+                sb.append("rowInTable=").append(targetTableRow).append(", ");
+            }
+        }
+        if (!tableBorder) sb.append("tableBorder=off, ");
         if (!skipMarkers.isEmpty()) sb.append("skipMarkers=").append(skipMarkers).append(", ");
         if (!skipLineNumbers.isEmpty()) sb.append("skipLines=").append(skipLineNumbers).append(", ");
-        if (sb.charAt(sb.length() - 2) == ',') sb.setLength(sb.length() - 2);
+        if (sb.length() >= 2 && sb.charAt(sb.length() - 2) == ',') sb.setLength(sb.length() - 2);
         sb.append("]");
         return sb.toString();
     }

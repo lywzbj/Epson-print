@@ -4,11 +4,13 @@ import org.example.config.PrintConfig;
 import org.example.connection.JavaxPrintConnection;
 import org.example.connection.PrinterConnection;
 import org.example.service.PrinterService;
+import org.example.word.PrintJob;
 import org.example.word.PrintSelector;
 import org.example.word.WordDocument;
 import org.example.word.WordPrinter;
 
 import java.io.IOException;
+import java.util.List;
 
 /**
  * EPSON DLQ-3500K 打印机控制程序入口。
@@ -35,8 +37,8 @@ public class App {
         try {
             printer.open();
 
-            // 打印文档第 1 页的第 5 行
-            printLineOfPage(printer, DEFAULT_FILE, 1, 5);
+            // 【示例】混合打印：第 1 页全部 + 第 2 页某几行（页内行号）
+            printMixedJob(printer, DEFAULT_FILE);
 
         } catch (IOException e) {
             System.err.println("打印出错: " + e.getMessage());
@@ -52,6 +54,48 @@ public class App {
     // ================================================================
     // 打印功能（静态方法）
     // ================================================================
+
+    /**
+     * 混合打印 — 使用 PrintJob 一次性描述多段不同的打印需求。
+     *
+     * <p>典型场景：一次打印中既有整页，又有某页的几行，还有某页表格的几行。
+     * 所有选择按页级语义描述（页内行号/表格内行号），PrintJob 内部自动转为全局索引。
+     *
+     * <p>完整版用法示例（当文档足够大时）：
+     * <pre>
+     *   PrintJob job = PrintJob.builder()
+     *       .select(1).all("封面页")                          // 第 1 页全部
+     *       .and()
+     *       .select(2).lines("第 2 页 第 3,5,7 行", 3, 5, 7)  // 第 2 页的几行
+     *       .and()
+     *       .select(3).table(0).rows("第 3 页表格 #0 第 1~3 行", 1, 2, 3).noBorder()
+     *       .build();
+     *   job.execute(printer, doc);
+     * </pre>
+     */
+    public static void printMixedJob(PrinterService printer, String filePath)
+            throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  混合打印 (PrintJob)");
+        System.out.println("  文件: " + filePath);
+        System.out.println("==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+        int totalPages = doc.getTotalPages();
+        int tableCount = doc.getTableCount();
+        System.out.println("  文档: " + doc.getParagraphCount() + " 段, "
+                + totalPages + " 页, " + tableCount + " 个表格");
+
+        // 混合选择：页1正文 + 同页表格第1行（不带边框）
+        PrintJob job = PrintJob.builder()
+                .select(1).all("第 1 页 全部正文内容")
+                .build();
+
+        job.execute(printer, doc);
+    }
 
     /**
      * 打印 Word 文档中指定页的指定行。
@@ -88,6 +132,63 @@ public class App {
                 .lineRange(globalLine, globalLine);
 
         // 5. 打印
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        System.out.println("\n  打印完成!");
+    }
+
+    /**
+     * 打印 Word 文档的指定页，跳过若干行和空行。
+     *
+     * <p>PrintSelector 支持的跳过方式：
+     * <ul>
+     *   <li>{@code .skipLines(n1, n2, ...)}    — 跳过指定全局行号</li>
+     *   <li>{@code .skipEmptyLines(true)}      — 跳过空行</li>
+     *   <li>{@code .skipByMarker("###SKIP")}   — 跳过含标记文本的行</li>
+     * </ul>
+     * 以上三种可任意链式组合。
+     *
+     * @param printer    已打开的 PrinterService
+     * @param filePath   Word 文件路径
+     * @param page       页号 (1-based)
+     * @param skipLines  该页内要跳过的行号 (相对于页起始，1-based)
+     */
+    public static void printPageSkipLines(PrinterService printer, String filePath,
+                                           int page, int... skipLines) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印单页并跳过指定行");
+        System.out.println("  文件: " + filePath);
+        System.out.println("  页码: " + page);
+        System.out.println("==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+
+        // 计算该页的起止行号 (全局)
+        int pageStart = (page - 1) * doc.getLinesPerPage() + 1;
+        int pageEnd   = Math.min(page * doc.getLinesPerPage(), doc.getParagraphCount());
+        System.out.println("  页范围: 全局行 " + pageStart + " ~ " + pageEnd
+                + " (共 " + (pageEnd - pageStart + 1) + " 行)");
+
+        // 将页内行号转为全局行号
+        StringBuilder skipInfo = new StringBuilder();
+        int[] globalSkips = new int[skipLines.length];
+        for (int i = 0; i < skipLines.length; i++) {
+            globalSkips[i] = pageStart + skipLines[i] - 1;
+            if (i > 0) skipInfo.append(", ");
+            skipInfo.append("页内第").append(skipLines[i]).append("行→全局行").append(globalSkips[i]);
+        }
+        System.out.println("  跳过: " + skipInfo);
+
+        // 构建选择器：打印整页，但跳过指定行 + 空行
+        PrintSelector selector = new PrintSelector()
+                .lineRange(pageStart, pageEnd)
+                .skipLines(globalSkips)
+                .skipEmptyLines(true);
+
         WordPrinter wordPrinter = new WordPrinter(printer);
         wordPrinter.print(doc, selector);
 
@@ -155,6 +256,239 @@ public class App {
         wordPrinter.print(doc, selector);
 
         System.out.println("\n  打印完成!");
+    }
+
+    /**
+     * 打印 Word 文档中指定表格的指定行数据。
+     *
+     * <p>使用 PrintSelector 的链式 API 精确过滤：
+     * <ol>
+     *   <li>{@code .skipNonTable(true)} — 跳过所有非表格段落</li>
+     *   <li>{@code .tableRow(tableIndex, rowInTable)} — 精确匹配表格 + 行号</li>
+     * </ol>
+     *
+     * <p>调用方式：
+     * <pre>
+     *   printTableRow(printer, "test.docx", 0, 1);  // 第 1 个表格的第 1 行
+     *   printTableRow(printer, "test.docx", 1, 3);  // 第 2 个表格的第 3 行
+     * </pre>
+     *
+     * @param printer    已打开的 PrinterService
+     * @param filePath   Word 文件路径
+     * @param tableIndex 表格序号 (0-based，Word 文档中第几个表格)
+     * @param rowInTable 表格内行号 (1-based，含表头)
+     */
+    public static void printTableRow(PrinterService printer, String filePath,
+                                      int tableIndex, int rowInTable) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印表格指定行");
+        System.out.println("  文件: " + filePath);
+        System.out.println("  表格序号: " + tableIndex + " (第 " + (tableIndex + 1) + " 个表格)");
+        System.out.println("  行号: " + rowInTable);
+        System.out.println("==========================================");
+
+        // 1. 配置
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        // 2. 加载文档
+        WordDocument doc = WordDocument.load(filePath);
+        System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落");
+
+        // 3. 预览表格信息
+        int tableCount = doc.getTableCount();
+        System.out.println("  文档中共 " + tableCount + " 个表格");
+
+        if (tableIndex >= tableCount) {
+            System.out.println("  错误: 表格序号 " + tableIndex + " 超出范围 (0~" + (tableCount - 1) + ")");
+            return;
+        }
+
+        List<WordDocument.WordParagraph> tableRows = doc.getTableParagraphs(tableIndex);
+        System.out.println("  表格 #" + tableIndex + " 共 " + tableRows.size() + " 行:");
+
+        // 打印表格内容预览
+        for (WordDocument.WordParagraph row : tableRows) {
+            String text = row.getText();
+            System.out.println("    第 " + row.getRowInTable() + " 行: "
+                    + (text.length() > 70 ? text.substring(0, 67) + "..." : text));
+        }
+
+        // 4. 检查目标行是否存在
+        WordDocument.WordParagraph targetRow = doc.getTableRow(tableIndex, rowInTable);
+        if (targetRow == null) {
+            System.out.println("  错误: 表格 #" + tableIndex + " 中不存在第 " + rowInTable + " 行");
+            return;
+        }
+
+        // 5. 构建选择器 — 只打印目标表格行，去掉边框
+        PrintSelector selector = new PrintSelector()
+                .tableRow(tableIndex, rowInTable)   // 精确匹配：第几个表格的第几行
+                .tableBorder(false);                 // 去掉 " | " 分隔符
+
+        // 6. 打印
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        System.out.println("\n  打印完成!");
+        System.out.println("  已打印: 表格 #" + tableIndex + " 第 " + rowInTable + " 行");
+    }
+
+    /**
+     * 打印 Word 文档中不连续的多行（白名单模式）。
+     *
+     * <p>内部使用 {@code PrintSelector.selectLines()} 白名单机制，
+     * 精确选中指定行号，未列出的行全部跳过。
+     *
+     * <p>调用示例：
+     * <pre>
+     *   printSelectedLines(printer, "test.docx", 1, 3, 5, 7);  // 只打第 1,3,5,7 行
+     *   printSelectedLines(printer, "test.docx", 2, 4);        // 只打第 2,4 行
+     * </pre>
+     */
+    public static void printSelectedLines(PrinterService printer, String filePath,
+                                           int... lineNumbers) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印指定多行（不连续）");
+        System.out.println("  文件: " + filePath);
+        System.out.print("  行号: ");
+        for (int i = 0; i < lineNumbers.length; i++) {
+            if (i > 0) System.out.print(", ");
+            System.out.print(lineNumbers[i]);
+        }
+        System.out.println("\n==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+        System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落");
+
+        // 使用白名单
+        PrintSelector selector = new PrintSelector()
+                .selectLines(lineNumbers);
+
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        System.out.println("\n  打印完成!");
+        System.out.println("  已打印: " + lineNumbers.length + " 行 (行号: " + join(lineNumbers) + ")");
+    }
+
+    /**
+     * 打印 Word 文档中不连续的多行（黑名单模式）。
+     *
+     * <p>内部使用 {@code lineRange() + skipLines()} 组合：
+     * 先划定一个连续范围，再从其中排除指定行。
+     *
+     * <p>适用场景：范围中大部分行要打，只排除少数几行。
+     */
+    public static void printRangeExcluding(PrinterService printer, String filePath,
+                                            int from, int to, int... exclude) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印范围并排除指定行");
+        System.out.println("  文件: " + filePath);
+        System.out.println("  范围: " + from + " ~ " + to);
+        System.out.print("  排除: ");
+        for (int i = 0; i < exclude.length; i++) {
+            if (i > 0) System.out.print(", ");
+            System.out.print(exclude[i]);
+        }
+        System.out.println("\n==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+
+        PrintSelector selector = new PrintSelector()
+                .lineRange(from, to)
+                .skipLines(exclude)
+                .skipEmptyLines(true);
+
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        int expected = (to - from + 1) - exclude.length;
+        System.out.println("\n  打印完成! 预计 " + expected + " 行");
+    }
+
+    /** 简单的 int 数组拼接，避免 Arrays.toString() 的方括号 */
+    private static String join(int[] arr) {
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < arr.length; i++) {
+            if (i > 0) sb.append(", ");
+            sb.append(arr[i]);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 打印 Word 文档中指定表格的多行数据。
+     *
+     * <p>PrintSelector 的表格多行选择方式：
+     * <ul>
+     *   <li>{@code .tableRows(0, 1, 5)} — 表格 #0 的第 1~5 行（范围）</li>
+     *   <li>{@code .tableRows(0, 2, 2)} — 表格 #0 的第 2 行（等同于 tableRow(0,2)）</li>
+     *   <li>{@code .skipNonTable(true)} — 只打印表格行，跳过正文</li>
+     *   <li>{@code .tableBorder(false)} — 去掉单元格分隔符</li>
+     * </ul>
+     *
+     * @param printer    已打开的 PrinterService
+     * @param filePath   Word 文件路径
+     * @param tableIndex 表格序号 (0-based)
+     * @param fromRow    起始行号 (1-based, 含)
+     * @param toRow      结束行号 (1-based, 含)
+     * @param border     是否保留表格边框分隔符
+     */
+    public static void printTableRows(PrinterService printer, String filePath,
+                                       int tableIndex, int fromRow, int toRow,
+                                       boolean border) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印表格多行");
+        System.out.println("  文件: " + filePath);
+        System.out.println("  表格: #" + tableIndex + " (第 " + (tableIndex + 1) + " 个表格)");
+        System.out.println("  行范围: " + fromRow + " ~ " + toRow);
+        System.out.println("  边框: " + (border ? "保留" : "去掉"));
+        System.out.println("==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+        System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落, "
+                + doc.getTableCount() + " 个表格");
+
+        // 校验
+        if (tableIndex >= doc.getTableCount()) {
+            System.out.println("  错误: 表格序号 " + tableIndex + " 超出范围");
+            return;
+        }
+
+        // 预览表格
+        List<WordDocument.WordParagraph> allRows = doc.getTableParagraphs(tableIndex);
+        System.out.println("  表格 #" + tableIndex + " 共 " + allRows.size() + " 行:");
+        for (WordDocument.WordParagraph row : allRows) {
+            int rn = row.getRowInTable();
+            boolean willPrint = (rn >= fromRow && rn <= toRow);
+            String marker = willPrint ? "  ← 打印" : "";
+            String text = row.getText();
+            System.out.println("    第 " + rn + " 行: "
+                    + (text.length() > 60 ? text.substring(0, 57) + "..." : text)
+                    + marker);
+        }
+
+        // 构建选择器
+        PrintSelector selector = new PrintSelector()
+                .tableRows(tableIndex, fromRow, toRow)
+                .tableBorder(border);
+
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        int count = toRow - fromRow + 1;
+        System.out.println("\n  打印完成!");
+        System.out.println("  已打印: 表格 #" + tableIndex + " 第 " + fromRow + "~" + toRow + " 行 (共 " + count + " 行)");
     }
 
     /**

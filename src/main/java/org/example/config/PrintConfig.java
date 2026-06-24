@@ -265,6 +265,18 @@ public class PrintConfig {
         return physicalPaper.linesAt6LPI() - topMargin - bottomMargin;
     }
 
+    /**
+     * 根据当前 CPI 设置，计算每逻辑页可容纳的字符列数。
+     * 多页拼合时返回逻辑页的列宽，普通模式返回物理纸张列宽。
+     * 已扣除左边距。此值用于设置打印机右边界 (ESC Q)，超出时硬件自动换行。
+     */
+    public int effectiveColumns() {
+        PaperSize effectivePaper = pageLayout.isMultiUp()
+                ? pageLayout.getLogicalPageSize()
+                : physicalPaper;
+        return Math.max(1, effectivePaper.columnsAt(cpi) - leftMargin);
+    }
+
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder("PrintConfig{");
@@ -301,27 +313,49 @@ public class PrintConfig {
      * </ul>
      */
     public static class Builder {
+        /** 物理纸张尺寸，默认 A4 (210×297mm) */
         private PaperSize physicalPaper = PaperSize.A4;
+        /** 页面布局模式，默认普通单页 (1-up)。设为 twoUp/fourUp 启用多页拼合 */
         private PageLayout pageLayout = PageLayout.normal();
+        /** 顶部留白行数，默认 0。不影响页长，仅调整起始打印位置 */
         private int topMargin = 0;
+        /** 底部留白行数（页缝跳过 ESC N），默认 0。用于连续纸跳过页缝区域 */
         private int bottomMargin = 0;
+        /** 左边界列数 (ESC l)，默认 0。从第几列开始打印，配合 CPI 换算距离 */
         private int leftMargin = 0;
+        /** 右边界列数 (ESC Q)，默认 0=自动计算。设为 >0 则覆盖自动值，超出此列硬件自动换行 */
         private int rightMargin = 0;
+        /** 每英寸字符数，默认 10。可选 10/12/15，值越大字越小、每行容纳更多字符 */
         private int cpi = 10;
+        /** 行间距模式，默认 1/6 英寸 (常规行距)。可选 1/8"、n/216"、n/72" */
         private LineSpacing lineSpacing = LineSpacing.ONE_SIXTH;
+        /** 行间距参数值，默认 0。仅 lineSpacing 为 N_216TH 或 N_72ND 时有效 */
         private int lineSpacingValue = 0;
+        /** 加粗开关 (ESC E/F)，默认关。对应 ESC E → 开, ESC F → 关 */
         private boolean bold = false;
+        /** 斜体开关 (ESC 4/5)，默认关。对应 ESC 4 → 开, ESC 5 → 关 */
         private boolean italic = false;
+        /** 下划线模式 (ESC - n)，默认 0=关。1=单下划线, 2=双下划线 */
         private int underlineMode = 0;
+        /** 双重打印开关 (ESC G/H)，默认关。击打两次增加墨色浓度 */
         private boolean doubleStrike = false;
+        /** 倍宽开关 (ESC W)，默认关。字符横向放大 2 倍 */
         private boolean doubleWidth = false;
+        /** 倍高开关 (ESC w)，默认关。字符纵向放大 2 倍 */
         private boolean doubleHeight = false;
+        /** 英文字体编号 (ESC k n)，默认 0=Roman。可选 1=SansSerif, 2=Courier 等 */
         private int fontIndex = 0;
+        /** 汉字字体，默认宋体 (FS K 0)。可选 SONG_TI(0) 或 HEI_TI(1) */
         private ChineseFont chineseFont = ChineseFont.SONG_TI;
+        /** 汉字宽度倍数 (FS S)，默认 1 (标准)。范围 1~4 */
         private int chineseCharWidth = 1;
+        /** 汉字高度倍数 (FS S)，默认 1 (标准)。范围 1~4 */
         private int chineseCharHeight = 1;
+        /** 汉字纵向打印开关 (FS V)，默认关。开启后汉字旋转 90° 纵向排列 */
         private boolean verticalPrint = false;
+        /** 单向打印模式 (ESC U)，默认关。开启后打印头只从左→右做工，精度更高但速度减半 */
         private boolean unidirectional = false;
+        /** 是否在 applyConfig 开始时自动发送 ESC @ 初始化命令，默认开 */
         private boolean autoInit = true;
 
         // -- 纸张与布局 --

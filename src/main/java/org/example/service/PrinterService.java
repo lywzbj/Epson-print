@@ -292,15 +292,12 @@ public class PrinterService {
         int pageLines = config.effectivePageLines();
         send(EscpCommand.setPageLength(pageLines));
 
-        // 5. 边距
+        // 5. 边距（左边界先设，右边界在 CPI 之后设以确保列数计算正确）
         if (config.getBottomMargin() > 0) {
             send(EscpCommand.setBottomMargin(config.getBottomMargin()));
         }
         if (config.getLeftMargin() > 0) {
             send(EscpCommand.setLeftMargin(config.getLeftMargin()));
-        }
-        if (config.getRightMargin() > 0) {
-            send(EscpCommand.setRightMargin(config.getRightMargin()));
         }
 
         // 6. CPI
@@ -310,12 +307,19 @@ public class PrinterService {
             case 15: send(EscpCommand.select15CPI()); break;
         }
 
-        // 7. 英文字体
+        // 7. 右边界 — 根据逻辑页宽度自动计算，防止文字超出纸张
+        //     用户显式设置的右边界优先；否则使用 effectiveColumns()
+        int rightMargin = config.getRightMargin() > 0
+                ? config.getRightMargin()
+                : config.effectiveColumns();
+        send(EscpCommand.setRightMargin(rightMargin));
+
+        // 8. 英文字体
         if (config.getFontIndex() > 0) {
             send(EscpCommand.selectFont(config.getFontIndex()));
         }
 
-        // 8. 字体样式
+        // 9. 字体样式
         send(config.isBold() ? EscpCommand.boldOn() : EscpCommand.boldOff());
         send(config.isItalic() ? EscpCommand.italicOn() : EscpCommand.italicOff());
         if (config.getUnderlineMode() > 0) {

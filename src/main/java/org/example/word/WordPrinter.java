@@ -86,13 +86,13 @@ public class WordPrinter {
             int lineNumber = i + 1;  // 1-based
 
             // 选择器过滤
-            if (selector != null && !selector.shouldPrint(lineNumber, wp.getText())) {
+            if (selector != null && !selector.accept(lineNumber, wp)) {
                 skippedLines++;
                 continue;
             }
 
             // 应用格式并打印
-            printParagraph(wp);
+            printParagraph(wp, selector);
             printedLines++;
         }
 
@@ -108,9 +108,13 @@ public class WordPrinter {
 
     /**
      * 打印单个段落，自动应用 Word 格式 → ESC/P-K 命令。
+     *
+     * @param wp       段落
+     * @param selector 选择器 (可为 null，用于格式化表格文本)
      */
-    private void printParagraph(WordDocument.WordParagraph wp) throws IOException {
-        String text = wp.getText();
+    private void printParagraph(WordDocument.WordParagraph wp, PrintSelector selector) throws IOException {
+        // 表格文本格式化（去掉边框等）
+        String text = selector != null ? selector.formatTableText(wp) : wp.getText();
 
         // 空段落：只输出换行
         if (text.trim().isEmpty()) {
@@ -370,7 +374,7 @@ public class WordPrinter {
 
             for (int j = startLine; j < endLine; j++) {
                 WordDocument.WordParagraph wp = selected.get(j);
-                printParagraph(wp);
+                printParagraph(wp, selector);
             }
 
             // 逻辑页内容不够填满时，补空行
