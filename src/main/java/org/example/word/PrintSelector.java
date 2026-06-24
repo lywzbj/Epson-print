@@ -45,6 +45,7 @@ public class PrintSelector {
     private int targetTableRow = 0;             // 目标表格行号 (1-based, 0=不限)
     private int targetTableRowEnd = 0;          // 目标表格行结束号 (>=targetTableRow 时表示范围)
     private boolean tableBorder = true;         // 是否保留表格边框 (false=去掉 " | " 分隔符)
+    private boolean leaveBlank = false;         // 跳过行时是否留白进纸 (false=跳过不占位, true=发LF留空行)
 
     // ======== 构建方法 (链式) ========
 
@@ -134,6 +135,37 @@ public class PrintSelector {
     }
 
     /**
+     * 跳过从第 1 行开始的连续 N 行。
+     * 组合 lineRange 时，从范围起始处开始跳过。
+     *
+     * <p>示例：跳过前 3 行（常用于去掉封面/标题行）
+     * <pre>
+     *   new PrintSelector().lineRange(1, 100).skipFirst(3);
+     * </pre>
+     */
+    public PrintSelector skipFirst(int count) {
+        for (int i = 1; i <= count; i++) {
+            this.skipLineNumbers.add(i);
+        }
+        return this;
+    }
+
+    /**
+     * 跳过从指定偏移开始的连续 N 行。
+     *
+     * <p>示例：从第 10 行开始跳过 5 行 (10~14)
+     * <pre>
+     *   new PrintSelector().skipRange(10, 5);
+     * </pre>
+     */
+    public PrintSelector skipRange(int from, int count) {
+        for (int i = 0; i < count; i++) {
+            this.skipLineNumbers.add(from + i);
+        }
+        return this;
+    }
+
+    /**
      * 只打印指定行号（全局，白名单）。
      * 设置后 lineRange 失效，只打印白名单中的行。
      * 可与 skipLines 叠加：白名单中的行如果也在 skipLines 中，仍被跳过。
@@ -198,6 +230,18 @@ public class PrintSelector {
      */
     public PrintSelector tableBorder(boolean on) {
         this.tableBorder = on;
+        return this;
+    }
+
+    /**
+     * 跳过行时是否在纸上留白（发送 LF 进纸空行）。
+     * <ul>
+     *   <li>{@code leaveBlank(false)} — 默认：跳过的行不占纸面，后续内容紧密排列</li>
+     *   <li>{@code leaveBlank(true)}  — 跳过时发 LF，纸继续走，保留空白位置</li>
+     * </ul>
+     */
+    public PrintSelector leaveBlank(boolean on) {
+        this.leaveBlank = on;
         return this;
     }
 
@@ -309,6 +353,7 @@ public class PrintSelector {
     public int lineEnd() { return lineEnd; }
     public int linesPerPage() { return linesPerPage; }
     public boolean isTableBorder() { return tableBorder; }
+    public boolean isLeaveBlank()  { return leaveBlank; }
 
     @Override
     public String toString() {
@@ -327,6 +372,7 @@ public class PrintSelector {
             }
         }
         if (!tableBorder) sb.append("tableBorder=off, ");
+        if (leaveBlank) sb.append("leaveBlank, ");
         if (!skipMarkers.isEmpty()) sb.append("skipMarkers=").append(skipMarkers).append(", ");
         if (!skipLineNumbers.isEmpty()) sb.append("skipLines=").append(skipLineNumbers).append(", ");
         if (sb.length() >= 2 && sb.charAt(sb.length() - 2) == ',') sb.setLength(sb.length() - 2);

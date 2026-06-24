@@ -2,6 +2,7 @@ package org.example.word;
 
 import org.example.command.EscpCommand;
 import org.example.config.PrintConfig;
+import org.example.preview.PrintPreview;
 import org.example.service.PrinterService;
 
 import java.io.IOException;
@@ -88,6 +89,10 @@ public class WordPrinter {
             // 选择器过滤
             if (selector != null && !selector.accept(lineNumber, wp)) {
                 skippedLines++;
+                // leaveBlank: 跳过的行仍然进纸留白
+                if (selector.isLeaveBlank() && !wp.isEmpty()) {
+                    printer.feedLines(1);
+                }
                 continue;
             }
 
@@ -104,45 +109,143 @@ public class WordPrinter {
         log(String.format("耗时: %dms", System.currentTimeMillis() - startTime));
     }
 
+    // ================================================================
+    // 生成打印预览 (HTML)
+    // ================================================================
+
+    /**
+     * 生成打印预览 — 不连接打印机，收集所有段落及其格式信息，
+     * 调用 {@link PrintPreview#writeHtml(String)} 输出为独立 HTML 文件。
+     *
+     * <p>典型用法：
+     * <pre>
+     *   PrintPreview preview = new PrintPreview("test.docx");
+     *   wordPrinter.generatePreview(doc, selector, preview);
+     *   preview.writeHtml("E:\\tmp\\preview.html");
+     *   System.out.println("预览: " + preview.getHtmlPath());
+     * </pre>
+     *
+     * @param doc      已加载的 Word 文档
+     * @param selector 行选择规则 (可为 null)
+     * @param preview  预览记录器 (传入空实例，方法填充)
+     */
+    public void generatePreview(WordDocument doc, PrintSelector selector,
+                                 PrintPreview preview) {
+        long startTime = System.currentTimeMillis();
+
+        log("文档: " + doc.getFilePath());
+        log("规则: " + (selector != null ? selector.toString() : "全部"));
+
+        List<WordDocument.WordParagraph> paragraphs = doc.getAllParagraphs();
+        int totalLines = paragraphs.size();
+        int recordedLines = 0;
+        int skippedLines = 0;
+
+        for (int i = 0; i < totalLines; i++) {
+            WordDocument.WordParagraph wp = paragraphs.get(i);
+            int lineNumber = i + 1;
+
+            // 选择器过滤
+            if (selector != null && !selector.accept(lineNumber, wp)) {
+                skippedLines++;
+                // leaveBlank: 预览中也标记为空白行（分隔符）
+                if (selector.isLeaveBlank() && !wp.isEmpty()) {
+                    preview.addSeparator();
+                }
+                continue;
+            }
+
+            // 表格文本格式化
+            String text = selector != null ? selector.formatTableText(wp) : wp.getText();
+
+            // 空段：记录一个分隔
+            if (text.trim().isEmpty()) {
+                preview.addSeparator();
+                recordedLines++;
+                continue;
+            }
+
+            // 对齐 + 首行缩进
+            String aligned = applyAlignmentForPreview(wp, text);
+            preview.addLine(wp, aligned, lineNumber);
+            recordedLines++;
+        }
+
+        log("------------------------------");
+        log(String.format("预览收集: %d 行已记录, %d 行已跳过, 共 %d 行",
+                recordedLines, skippedLines, totalLines));
+        log(String.format("耗时: %dms", System.currentTimeMillis() - startTime));
+    }
+
+    /**
+     * 对齐和缩进的纯文本近似（预览使用，不依赖打印机）。
+     */
+    private String applyAlignmentForPreview(WordDocument.WordParagraph wp, String text) {
+        int indentFL = wp.getIndentFirstLine();
+        int align = wp.getAlignment();
+
+        String result = text;
+
+        // 首行缩进 → 前置空格 (1pt ≈ 1.33 空格)
+        if (indentFL > 0) {
+            int spaces = Math.max(0, indentFL / 15);
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < spaces; i++) sb.append(' ');
+            result = sb.append(text).toString();
+        }
+
+        // 对齐 (HTML 用 CSS text-align, 此处只做基本空格补齐)
+        // 实际对齐效果由 HTML 的 text-align CSS 属性完成
+        return result;
+    }
+
     // ======== 段落打印 ========
 
     /**
      * 打印单个段落，自动应用 Word 格式 → ESC/P-K 命令。
-     *
-     * @param wp       段落
-     * @param selector 选择器 (可为 null，用于格式化表格文本)
      */
     private void printParagraph(WordDocument.WordParagraph wp, PrintSelector selector) throws IOException {
-        // 表格文本格式化（去掉边框等）
         String text = selector != null ? selector.formatTableText(wp) : wp.getText();
 
-        // 空段落：只输出换行
         if (text.trim().isEmpty()) {
             printer.feedLines(1);
             return;
         }
 
-        // 应用字体样式
+        // 1. 段落间距：段前行距 + 行间距
+        applyParagraphSpacingBefore(wp);
+        applyParagraphLineSpacing(wp);
+
+        // 2. 段落缩进与对齐
+        applyParagraphIndent(wp);
+        String alignedText = applyParagraphAlignment(wp, text);
+
+        // 3. 字体样式
         applyFormat(wp);
 
-        // 选择打印模式
+        // 4. 打印内容
         if (wp.shouldUseChineseMode()) {
-            // 汉字模式
             printer.enterChineseMode();
             if (wp.getFontName() != null) {
                 applyChineseFont(wp.getFontName());
             }
-            printer.sendRaw(EscpCommand.encodeChinese(text));
+            int fontSizePt = wp.getFontSizePt();
+            if (fontSizePt > 0 && fontSizePt != currentChineseFontSize) {
+                applyChineseFontSize(fontSizePt);
+                currentChineseFontSize = fontSizePt;
+            }
+            printer.sendRaw(EscpCommand.encodeChinese(alignedText));
             printer.send(EscpCommand.carriageReturn());
             printer.send(EscpCommand.lineFeed());
             printer.exitChineseMode();
         } else {
-            // 英文/ASCII 模式
-            printer.printText(text);
+            printer.printText(alignedText);
         }
 
-        // 恢复默认格式
+        // 5. 恢复格式 + 段后间距
         resetFormat(wp);
+        restoreParagraphIndent(wp);
+        applyParagraphSpacingAfter(wp);
     }
 
     // ======== 格式映射 ========
@@ -182,42 +285,92 @@ public class WordPrinter {
     }
 
     /**
-     * 字号映射到打印机命令。
+     * 将 Word 字号 (pt) 逐级映射到打印机能力范围内的最接近配置。
      *
-     * Word 字号参考 (pt):
-     *   五号=10.5, 小四=12, 四号=14, 小三=15, 三号=16,
-     *   小二=18, 二号=22, 小一=24, 一号=26, 初号=42
+     * <p>打印机可用档位（CPI + 倍宽 + 倍高 组合）及对应视觉大小：
+     * <pre>
+     *   15CPI             → 约  8pt  (极细注释)
+     *   12CPI             → 约 10pt  (脚注/小字)
+     *   10CPI             → 约 12pt  (正文)
+     *   15CPI + 倍宽       → 约 16pt  (小节标题)
+     *   12CPI + 倍宽       → 约 20pt  (节标题)
+     *   10CPI + 倍宽       → 约 24pt  (章标题)
+     *   10CPI + 倍宽 + 倍高 → 约 24pt×24pt (封面标题)
+     * </pre>
      *
-     * 打印机映射策略:
-     *   ≤10pt  → 15CPI (压缩)
-     *   10-12pt → 12CPI (正常)
-     *   ≥14pt  → 10CPI + 可能倍高
-     *   ≥24pt  → 10CPI + 倍宽倍高
+     * <p>算法：给定 Word pt 值，遍历所有组合计算误差，取误差最小的配置。
+     * 同时高度维度独立判断是否需要倍高（≥18pt 开启）。
      */
     private void applyFontSize(int fontSizePt) throws IOException {
-        if (fontSizePt <= 10) {
-            printer.select15CPI();
-        } else if (fontSizePt <= 12) {
-            printer.select12CPI();
-        } else {
-            printer.select10CPI();
+        if (fontSizePt <= 0) return;
+
+        // 可用宽度配置：(cpi, doubleWidth) → 等效视觉 pt
+        // 10 CPI ≈ 12pt 基准，宽度与 CPI 成反比
+        final int[][] WIDTH_OPTIONS = {
+            {15, 0},  // ~ 8pt
+            {12, 0},  // ~10pt
+            {10, 0},  // ~12pt
+            {15, 1},  // ~16pt
+            {12, 1},  // ~20pt
+            {10, 1},  // ~24pt
+        };
+        final int[] WIDTH_PTS = {8, 10, 12, 16, 20, 24};
+
+        // 找最接近的宽度配置
+        int bestIdx = 0;
+        int bestDiff = Integer.MAX_VALUE;
+        for (int i = 0; i < WIDTH_PTS.length; i++) {
+            int diff = Math.abs(fontSizePt - WIDTH_PTS[i]);
+            if (diff < bestDiff) { bestDiff = diff; bestIdx = i; }
         }
 
-        // 大字：倍高/倍宽
-        if (fontSizePt >= 24) {
-            printer.doubleWidth(true);
-            printer.doubleHeight(true);
-        } else if (fontSizePt >= 16) {
-            printer.doubleHeight(true);
-            printer.doubleWidth(false);
-        } else if (fontSizePt >= 14) {
-            printer.doubleWidth(true);
-            printer.doubleHeight(false);
-        } else {
-            printer.doubleWidth(false);
-            printer.doubleHeight(false);
+        int bestCPI  = WIDTH_OPTIONS[bestIdx][0];
+        int bestDW   = WIDTH_OPTIONS[bestIdx][1];
+        // 高度维度：大字号自动倍高
+        int bestDH   = (fontSizePt >= 18) ? 1 : 0;
+
+        // 应用
+        switch (bestCPI) {
+            case 10: printer.select10CPI(); break;
+            case 12: printer.select12CPI(); break;
+            case 15: printer.select15CPI(); break;
         }
+        printer.doubleWidth(bestDW == 1);
+        printer.doubleHeight(bestDH == 1);
     }
+
+    /**
+     * 将 Word 字号映射为汉字字符大小 (FS S w h)。
+     *
+     * <p>FS S 基准：1×1 ≈ 10.5pt (宋体五号)
+     * <pre>
+     *   w/h = round(pt / 10.5)，范围 clamp 到 1~4
+     *   如 12pt → 1×1, 16pt → 2×2, 22pt → 2×2, 26pt → 2×3, 36pt → 3×3, 42pt → 4×4
+     * </pre>
+     */
+    private void applyChineseFontSize(int fontSizePt) throws IOException {
+        if (fontSizePt <= 0) return;
+
+        double baseline = 10.5;
+        int w = (int) Math.round(fontSizePt / baseline);
+        int h = (int) Math.round(fontSizePt / baseline);
+
+        // 标题级别：高度比宽度多一档更接近 Word 排版比例
+        if (fontSizePt >= 22 && h <= w && h < 4) {
+            h = Math.min(4, w + 1);
+        }
+
+        w = Math.max(1, Math.min(4, w));
+        h = Math.max(1, Math.min(4, h));
+
+        printer.send(EscpCommand.setChineseCharacterSize(w, h));
+        currentChineseW = w;
+        currentChineseH = h;
+    }
+
+    /** 追踪当前汉字大小，避免冗余 FS S 命令 */
+    private int currentChineseW = 1;
+    private int currentChineseH = 1;
 
     /**
      * 汉字字体映射。
@@ -267,6 +420,162 @@ public class WordPrinter {
         currentUnderline = false;
         currentFont = null;
         currentFontSize = 0;
+        currentChineseW = 1;
+        currentChineseH = 1;
+        currentChineseFontSize = 0;
+    }
+
+    /** 当前汉字字号 (pt)，避免冗余 FS S 命令 */
+    private int currentChineseFontSize = 0;
+
+    // ================================================================
+    // 段落间距与缩进（从 Word 段落属性提取并映射到 ESC/P-K）
+    // ================================================================
+
+    /** 当前左缩进列数，用于段落后恢复 */
+    private int currentLeftIndentCols = 0;
+    /** 当前行间距 n/216" 值，避免冗余 ESC 3 命令。默认 36 = 1/6" */
+    private int currentLineSpacingN = 36;
+
+    /**
+     * 段前间距 — ESC J (进纸 n/216 英寸)。
+     */
+    private void applyParagraphSpacingBefore(WordDocument.WordParagraph wp) throws IOException {
+        int before = wp.getSpacingBefore();
+        if (before <= 0) return;
+        int n = twipsTo216(before);
+        if (n > 0) printer.send(EscpCommand.feedPaper216(n));
+    }
+
+    /**
+     * 段后间距 — ESC J (进纸 n/216 英寸)。
+     */
+    private void applyParagraphSpacingAfter(WordDocument.WordParagraph wp) throws IOException {
+        int after = wp.getSpacingAfter();
+        if (after <= 0) return;
+        int n = twipsTo216(after);
+        if (n > 0) printer.send(EscpCommand.feedPaper216(n));
+    }
+
+    /**
+     * 行间距 — ESC 3 n (n/216 英寸)。
+     *
+     * <p>Word 的 getSpacingBetween() 在不同规则下的语义：
+     * <ul>
+     *   <li>AUTO：返回值 = 240 × 倍率 (240=1.0倍行距, 360=1.5倍, 480=2倍)</li>
+     *   <li>EXACT：返回值 = 精确行距 (twip)</li>
+     *   <li>AT_LEAST：返回值 = 最小行距 (twip)</li>
+     * </ul>
+     */
+    private void applyParagraphLineSpacing(WordDocument.WordParagraph wp) throws IOException {
+        int sp = wp.getSpacingBetween();
+        if (sp <= 0) return;
+
+        int n;
+        if (sp >= 200) {
+            // ≥200 → AUTO 模式: 240 = 1.0 倍 = 1/6" = 36/216"
+            n = sp * 36 / 240;
+        } else {
+            // <200 → EXACT/AT_LEAST 模式: twip 直接换算
+            n = twipsTo216(sp);
+        }
+        if (n > 0 && n != currentLineSpacingN) {
+            printer.send(EscpCommand.setLineSpacing216(n));
+            currentLineSpacingN = n;
+        }
+    }
+
+    /**
+     * 左缩进 — ESC l n (设置左边界到第 n 列)。
+     * 段落结束后由 {@link #restoreParagraphIndent} 恢复。
+     */
+    private void applyParagraphIndent(WordDocument.WordParagraph wp) throws IOException {
+        int left = wp.getIndentLeft();
+        if (left > 0) {
+            int cols = twipsToColumns(left, wp.getFontSizePt());
+            if (cols > 0 && cols != currentLeftIndentCols) {
+                printer.send(EscpCommand.setLeftMargin(cols));
+                currentLeftIndentCols = cols;
+            }
+        }
+    }
+
+    /**
+     * 恢复段落左缩进。
+     */
+    private void restoreParagraphIndent(WordDocument.WordParagraph wp) throws IOException {
+        if (currentLeftIndentCols > 0 && wp.getIndentLeft() > 0) {
+            printer.send(EscpCommand.setLeftMargin(0));
+            currentLeftIndentCols = 0;
+        }
+    }
+
+    /**
+     * 首行缩进 + 对齐方式。
+     *
+     * <p>DLQ-3500K 无原生对齐命令，用前置空格近似实现：
+     * <ul>
+     *   <li>首行缩进 → 前置 N 个空格 (N = indentFirstLine / twips_per_col)</li>
+     *   <li>居中 → 前置 (lineWidth - textLen) / 2 个空格</li>
+     *   <li>右对齐 → 前置 (lineWidth - textLen) 个空格</li>
+     * </ul>
+     */
+    private String applyParagraphAlignment(WordDocument.WordParagraph wp, String text) {
+        int indentFL = wp.getIndentFirstLine();
+        int align = wp.getAlignment();
+
+        // 首行缩进
+        String result = text;
+        if (indentFL > 0) {
+            int spaces = twipsToColumns(indentFL, wp.getFontSizePt());
+            if (spaces > 0) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < spaces; i++) sb.append(' ');
+                result = sb.append(text).toString();
+            }
+        }
+
+        // 对齐 (仅 LEFT 以外的)
+        if (align == 1 || align == 2) {
+            // 估算一行可容纳的等宽字符数 (10CPI 基准, A4 ≈ 82 列)
+            int lineWidth = 82 - currentLeftIndentCols;
+            // 汉字按 2 字符粗略估算
+            int approxLen = 0;
+            for (char c : text.toCharArray()) {
+                approxLen += (c >= 0x4e00 && c <= 0x9fff) ? 2 : 1;
+            }
+
+            int pad;
+            if (align == 1) {
+                pad = Math.max(0, (lineWidth - approxLen) / 2);
+            } else {
+                pad = Math.max(0, lineWidth - approxLen);
+            }
+
+            if (pad > 0) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < pad; i++) sb.append(' ');
+                result = sb.append(text).toString();
+            }
+        }
+        return result;
+    }
+
+    // -- 单位换算 --
+
+    /** twip → n/216 英寸 (1 inch = 1440 twip, n/216 = twip * 216/1440 = twip * 3/20) */
+    private static int twipsTo216(int twips) {
+        return Math.max(1, twips * 3 / 20);
+    }
+
+    /** twip → 字符列数 (1 inch = 1440 twip), 根据字号推断 CPI */
+    private static int twipsToColumns(int twips, int fontSizePt) {
+        int cpi;
+        if (fontSizePt <= 10) cpi = 15;
+        else if (fontSizePt <= 12) cpi = 12;
+        else cpi = 10;
+        int twipsPerCol = 1440 / cpi;
+        return Math.max(0, twips / twipsPerCol);
     }
 
     // ================================================================
@@ -329,8 +638,11 @@ public class WordPrinter {
         for (int i = 0; i < paragraphs.size(); i++) {
             int lineNumber = i + 1;
             WordDocument.WordParagraph wp = paragraphs.get(i);
-            if (selector == null || selector.shouldPrint(lineNumber, wp.getText())) {
+            if (selector == null || selector.accept(lineNumber, wp)) {
                 selected.add(wp);
+            } else if (selector != null && selector.isLeaveBlank() && !wp.isEmpty()) {
+                // leaveBlank: 跳过的行插入空段落占位，保持逻辑页行数对齐
+                selected.add(new WordDocument.WordParagraph(""));
             }
         }
 

@@ -3,6 +3,7 @@ package org.example;
 import org.example.config.PrintConfig;
 import org.example.connection.JavaxPrintConnection;
 import org.example.connection.PrinterConnection;
+import org.example.preview.PrintPreview;
 import org.example.service.PrinterService;
 import org.example.word.PrintJob;
 import org.example.word.PrintSelector;
@@ -30,22 +31,18 @@ public class App {
     // ================================================================
 
     public static void main(String[] args) {
-        // ---- 创建连接 ----
         PrinterConnection connection = new JavaxPrintConnection(PRINTER_NAME);
         PrinterService printer = new PrinterService(connection);
-
         try {
             printer.open();
-
-            // 【示例】混合打印：第 1 页全部 + 第 2 页某几行（页内行号）
-            printMixedJob(printer, DEFAULT_FILE);
+            // 【示例】打印第 1 页，跳过前 2 行并留白进纸
+            printPageSkipWithBlank(printer, DEFAULT_FILE, 1, 2);
 
         } catch (IOException e) {
             System.err.println("打印出错: " + e.getMessage());
-            System.err.println("提示：如果打印机未连接，请检查网络或 USB 连接。");
         } finally {
             try {
-                printer.close();
+                printer.close();  // ★ 关键：close() 才真正提交打印任务
             } catch (IOException ignored) {
             }
         }
@@ -54,6 +51,184 @@ public class App {
     // ================================================================
     // 打印功能（静态方法）
     // ================================================================
+
+    /**
+     * 打印指定页，跳过该页的前 N 行（页内行号）。
+     *
+     * <p>典型场景：Word 文档第 1 页前 3 行是标题/副标题/日期，只想从第 4 行正文开始打。
+     */
+    public static void printPageSkipFirst(PrinterService printer, String filePath,
+                                           int page, int skipCount) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印第 " + page + " 页，跳过前 " + skipCount + " 行");
+        System.out.println("  文件: " + filePath);
+        System.out.println("==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+
+        // 将页内行号 → 全局行号
+        int pageBase = (page - 1) * doc.getLinesPerPage();
+        int pageStart = pageBase + 1;
+        int pageEnd   = Math.min(pageBase + doc.getLinesPerPage(), doc.getParagraphCount());
+
+        // 跳过前 skipCount 行 → 全局行号
+        int[] globalSkips = new int[skipCount];
+        for (int i = 0; i < skipCount; i++) {
+            globalSkips[i] = pageStart + i;
+        }
+
+        System.out.println("  页范围: 全局行 " + pageStart + " ~ " + pageEnd);
+        System.out.println("  跳过: 全局行 " + pageStart + " ~ " + (pageStart + skipCount - 1));
+
+        PrintSelector selector = new PrintSelector()
+                .lineRange(pageStart, pageEnd)
+                .skipLines(globalSkips);
+
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        System.out.println("\n  打印完成! (预计 " + (pageEnd - pageStart + 1 - skipCount) + " 行)");
+    }
+
+    /**
+     * 打印指定页，跳过前 N 行并留白进纸。
+     *
+     * <p>与 {@link #printPageSkipFirst} 的区别：跳过的行发送 LF 让纸继续走，
+     * 在纸上留下相应的空白行，后续内容从正确的位置开始打印。
+     *
+     * <p>适用场景：模板打印 — 文档前几行是 Logo/标题占位区域，
+     * 需要跳过但保留纸张空间供预印内容使用。
+     */
+    public static void printPageSkipWithBlank(PrinterService printer, String filePath,
+                                               int page, int skipCount) throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  打印第 " + page + " 页，跳过前 " + skipCount + " 行（留白进纸）");
+        System.out.println("  文件: " + filePath);
+        System.out.println("==========================================");
+
+        PrintConfig config = PrintConfig.defaultConfig();
+        printer.applyConfig(config);
+
+        WordDocument doc = WordDocument.load(filePath);
+
+        int pageBase = (page - 1) * doc.getLinesPerPage();
+        int pageStart = pageBase + 1;
+        int pageEnd   = Math.min(pageBase + doc.getLinesPerPage(), doc.getParagraphCount());
+
+        int[] skips = new int[skipCount];
+        for (int i = 0; i < skipCount; i++) {
+            skips[i] = pageStart + i;
+        }
+
+        System.out.println("  页范围: 全局行 " + pageStart + " ~ " + pageEnd);
+        System.out.println("  跳过留白: 全局行 " + pageStart + " ~ " + (pageStart + skipCount - 1));
+
+        PrintSelector selector = new PrintSelector()
+                .lineRange(pageStart, pageEnd)
+                .skipLines(skips)
+                .leaveBlank(true);          // ← 关键：跳过时发送 LF 进纸留白
+
+        WordPrinter wordPrinter = new WordPrinter(printer);
+        wordPrinter.print(doc, selector);
+
+        System.out.println("\n  打印完成! 前 " + skipCount + " 行已留白进纸");
+    }
+
+    /**
+     * 演示 PrintSelector 各种跳过模式的完整用法（生成预览文件，不连接打印机）。
+     */
+    public static void printSkipDemo(PrinterService printer, String filePath)
+            throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  跳过模式演示");
+        System.out.println("  文件: " + filePath);
+        System.out.println("==========================================");
+
+        WordDocument doc = WordDocument.load(filePath);
+        int totalLines = doc.getParagraphCount();
+
+        // ──── 模式 1：跳过前 N 行 ────
+        System.out.println("\n--- 模式 1: 跳过前 2 行 ---");
+        PrintSelector s1 = new PrintSelector().skipFirst(2);
+        WordPrinter wp = new WordPrinter(printer);
+        wp.print(doc, s1);
+
+        // ──── 模式 2：跳过指定几行（黑名单）───
+        System.out.println("\n--- 模式 2: 跳过第 3,5,7 行 ---");
+        PrintSelector s2 = new PrintSelector().skipLines(3, 5, 7);
+        wp.print(doc, s2);
+
+        // ──── 模式 3：范围内跳过一段连续行 ────
+        System.out.println("\n--- 模式 3: 1~20 行中跳过 5~10 行 ---");
+        PrintSelector s3 = new PrintSelector()
+                .lineRange(1, 20)
+                .skipRange(5, 6);   // 跳过第 5~10 行
+        wp.print(doc, s3);
+
+        // ──── 模式 4：跳过空行 ────
+        System.out.println("\n--- 模式 4: 跳过空行 ---");
+        PrintSelector s4 = new PrintSelector().skipEmptyLines(true);
+        wp.print(doc, s4);
+
+        // ──── 模式 5：跳过含标记的行 ────
+        System.out.println("\n--- 模式 5: 跳过含\"名词\"的行 ---");
+        PrintSelector s5 = new PrintSelector().skipByMarker("名词");
+        wp.print(doc, s5);
+
+        // ──── 模式 6：组合：跳过前 2 行 + 空行 ────
+        System.out.println("\n--- 模式 6: 跳过前 2 行 + 跳过空行 ---");
+        PrintSelector s6 = new PrintSelector().skipFirst(2).skipEmptyLines(true);
+        wp.print(doc, s6);
+
+        // ──── 模式 7：白名单反向 — 跳过所有不在白名单中的行 ────
+        System.out.println("\n--- 模式 7: 只打印第 1,3,5 行 (其余全跳过) ---");
+        PrintSelector s7 = new PrintSelector().selectLines(1, 3, 5);
+        wp.print(doc, s7);
+
+        System.out.println("\n  全部 7 种跳过模式演示完成!");
+    }
+
+    /**
+     * 生成打印预览 HTML 文件 — 不需要打印机连接，纯粹本地生成。
+     *
+     * <p>预览 HTML 包含：
+     * <ul>
+     *   <li>A4 纸尺寸页面 (210×297mm) 分页显示</li>
+     *   <li>每行标注全局行号 + 格式标签 (B/I/U/字号/表格/缩进/对齐/间距)</li>
+     *   <li>鼠标悬停高亮</li>
+     *   <li>浏览器打开即可预览，支持打印</li>
+     * </ul>
+     *
+     * @param filePath   Word 文件路径
+     * @param outputPath HTML 输出路径 (如 E:\tmp\preview.html)
+     */
+    public static void generatePreviewFile(String filePath, String outputPath)
+            throws IOException {
+        System.out.println("==========================================");
+        System.out.println("  生成打印预览");
+        System.out.println("  文件: " + filePath);
+        System.out.println("  输出: " + outputPath);
+        System.out.println("==========================================");
+
+        WordDocument doc = WordDocument.load(filePath);
+        System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落, "
+                + doc.getTableCount() + " 个表格");
+
+        // 创建预览记录器
+        PrintPreview preview = new PrintPreview(filePath);
+        WordPrinter wordPrinter = new WordPrinter(null, false); // verbose=false
+        wordPrinter.generatePreview(doc, null, preview);  // 全部内容
+        // 或带选择器: wordPrinter.generatePreview(doc, selector, preview);
+
+        // 写出 HTML
+        preview.writeHtml(outputPath);
+        System.out.println("\n  预览文件已生成: " + preview.getHtmlPath());
+        System.out.println("  共 " + preview.lineCount() + " 行");
+        System.out.println("  请用浏览器打开查看");
+    }
 
     /**
      * 混合打印 — 使用 PrintJob 一次性描述多段不同的打印需求。

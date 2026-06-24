@@ -332,17 +332,17 @@ public class PrintConfig {
         /** 行间距参数值，默认 0。仅 lineSpacing 为 N_216TH 或 N_72ND 时有效 */
         private int lineSpacingValue = 0;
         /** 加粗开关 (ESC E/F)，默认关。对应 ESC E → 开, ESC F → 关 */
-        private boolean bold = false;
+        private boolean bold = true;
         /** 斜体开关 (ESC 4/5)，默认关。对应 ESC 4 → 开, ESC 5 → 关 */
-        private boolean italic = false;
+        private boolean italic = true;
         /** 下划线模式 (ESC - n)，默认 0=关。1=单下划线, 2=双下划线 */
         private int underlineMode = 0;
         /** 双重打印开关 (ESC G/H)，默认关。击打两次增加墨色浓度 */
-        private boolean doubleStrike = false;
+        private boolean doubleStrike = true;
         /** 倍宽开关 (ESC W)，默认关。字符横向放大 2 倍 */
-        private boolean doubleWidth = false;
+        private boolean doubleWidth = true;
         /** 倍高开关 (ESC w)，默认关。字符纵向放大 2 倍 */
-        private boolean doubleHeight = false;
+        private boolean doubleHeight = true;
         /** 英文字体编号 (ESC k n)，默认 0=Roman。可选 1=SansSerif, 2=Courier 等 */
         private int fontIndex = 0;
         /** 汉字字体，默认宋体 (FS K 0)。可选 SONG_TI(0) 或 HEI_TI(1) */

@@ -121,7 +121,6 @@ public class WordDocument {
     private WordParagraph parseParagraph(XWPFParagraph para) {
         List<XWPFRun> runs = para.getRuns();
         if (runs.isEmpty()) {
-            // 可能是个空段落（只有换行）
             return new WordParagraph("");
         }
 
@@ -142,7 +141,7 @@ public class WordDocument {
             if (run.isItalic()) isItalic = true;
             if (run.getUnderline() != UnderlinePatterns.NONE) isUnderline = true;
 
-            int fs = run.getFontSize();
+            int fs = run.getFontSize();  // half-points, -1 = 继承段落/文档默认值
             if (fs > maxFontSize) maxFontSize = fs;
 
             if (fontName == null && run.getFontFamily() != null) {
@@ -153,16 +152,45 @@ public class WordDocument {
             }
         }
 
+        // 如果所有 run 的 fontSize 都为 -1（继承自样式未显式设置），
+        // 尝试从段落默认 Run 属性或文档默认样式中获取
+        if (maxFontSize <= 0) {
+            maxFontSize = resolveDefaultFontSize(para);
+        }
+
         String text = fullText.toString();
         if (text.isEmpty()) {
             return new WordParagraph("");
         }
 
+        // -- 段落级格式 --
+        int spBetween, spBefore, spAfter;
+        int indentL, indentFL;
+        int alignCode;
+
+        // 行间距
+        spBetween = (int) para.getSpacingBetween();  // AUTO=240×倍率, EXACT/AT_LEAST=twip
+        spBefore  = (int) para.getSpacingBefore();   // twip
+        spAfter   = (int) para.getSpacingAfter();    // twip
+
+        // 缩进
+        indentL  = para.getIndentationLeft();       // twip
+        indentFL = para.getIndentationFirstLine();  // twip
+
+        // 对齐
+        ParagraphAlignment pa = para.getAlignment();
+        if (pa == ParagraphAlignment.CENTER)      alignCode = 1;
+        else if (pa == ParagraphAlignment.RIGHT)  alignCode = 2;
+        else if (pa == ParagraphAlignment.BOTH)   alignCode = 3;
+        else                                       alignCode = 0;  // LEFT / null
+
         // 优先使用东亚字体名（中文环境）
         String effectiveFont = (fontNameEastAsia != null) ? fontNameEastAsia : fontName;
 
         return new WordParagraph(text, isBold, isItalic, isUnderline,
-                maxFontSize, effectiveFont);
+                maxFontSize, effectiveFont,
+                false, -1, 0,                                   // 非表格行
+                spBetween, spBefore, spAfter, indentL, indentFL, alignCode);
     }
 
     /**
@@ -175,6 +203,72 @@ public class WordDocument {
             if (t != null) sb.append(t);
         }
         return sb.toString();
+    }
+
+    /**
+     * 解析段落的默认字号（当 run 级别未显式设置 fontSize 时使用）。
+     *
+     * <p>run.getFontSize() 返回 -1 表示继承自段落/文档样式。
+     * 此方法按以下优先级尝试获取实际字号：
+     * <ol>
+     *   <li>段落的 styleID → 文档 styles.xml 中该样式的 rPr/sz 定义</li>
+     *   <li>硬编码回退: 24 half-points = 12pt (Word 正文默认)</li>
+     * </ol>
+     */
+    private int resolveDefaultFontSize(XWPFParagraph para) {
+        // 1. 通过段落样式 ID 查找文档 styles.xml 中的字号
+        try {
+            String styleId = para.getStyleID();
+            if (styleId != null) {
+                XWPFDocument doc = para.getDocument();
+                XWPFStyles styles = doc.getStyles();
+                XWPFStyle style = styles.getStyle(styleId);
+                if (style != null) {
+                    // 尝试从样式的 Run 属性获取字号 (half-points)
+                    int szFromStyle = extractFontSizeFromStyle(style);
+                    if (szFromStyle > 0) return szFromStyle;
+
+                    // 继承链：follow base style
+                    XWPFStyle base = style;
+                    for (int i = 0; i < 5; i++) {  // 最多追溯 5 级继承
+                        String baseId = base.getCTStyle().getBasedOn() != null
+                                ? base.getCTStyle().getBasedOn().getVal() : null;
+                        if (baseId == null) break;
+                        base = styles.getStyle(baseId);
+                        if (base == null) break;
+                        int inherited = extractFontSizeFromStyle(base);
+                        if (inherited > 0) return inherited;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 2. 回退：24 half-points = 12pt
+        return 24;
+    }
+
+    /** 从 XWPFStyle 中提取 Run 级字号 (half-points)，提取不到返回 -1 */
+    private int extractFontSizeFromStyle(XWPFStyle style) {
+        try {
+            if (style.getCTStyle().getRPr() == null) return -1;
+            // CTRPr 的 sz 属性 (half-points，如 24=12pt, 32=16pt, 44=22pt)
+            // 不同 POI 版本此元素的访问方式不同，通过 XML toString 安全提取
+            String rprXml = style.getCTStyle().getRPr().toString();
+            // 匹配 w:sz="320" 或 w:szCs="320" (单位: half-points × 10, POI 内部 × 10)
+            java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                    "w:sz(?:Cs)?=\"(\\d+)\"");
+            java.util.regex.Matcher m = p.matcher(rprXml);
+            if (m.find()) {
+                int val = Integer.parseInt(m.group(1));
+                // sz 在 XML 中存储为 half-points × 10 (如 12pt → 120)
+                // run.getFontSize() 返回 half-points (如 12pt → 24)
+                // 统一转换: XML 值 / 10 * 2 = half-points
+                return val / 5;
+            }
+        } catch (Exception ignored) {
+        }
+        return -1;
     }
 
     // ======== 查询方法 ========
@@ -318,24 +412,48 @@ public class WordDocument {
         private final int tableIndex;      // 来源表格序号 (0-based), 非表格=-1
         private final int rowInTable;      // 在表格中的行号 (1-based), 非表格=0
 
+        // 段落间距与缩进（从 Word 段落属性提取）
+        /** 行间距 (twip, 1/20 pt)。0 = 使用默认 */
+        private final int spacingBetween;
+        /** 段前间距 (twip) */
+        private final int spacingBefore;
+        /** 段后间距 (twip) */
+        private final int spacingAfter;
+        /** 左缩进 (twip) */
+        private final int indentLeft;
+        /** 首行缩进 (twip)。正=首行缩进, 负=悬挂缩进 */
+        private final int indentFirstLine;
+        /** 对齐方式 */
+        private final int alignment;  // 0=left, 1=center, 2=right, 3=both
+
         // 中文检测正则
         private static final Pattern CHINESE_PATTERN =
                 Pattern.compile("[\\u4e00-\\u9fff\\u3400-\\u4dbf]");
 
         /** 空段落 */
         public WordParagraph(String text) {
-            this(text, false, false, false, 0, null, false, -1, 0);
+            this(text, false, false, false, 0, null, false, -1, 0, 0, 0, 0, 0, 0, 0);
         }
 
         public WordParagraph(String text, boolean bold, boolean italic,
                              boolean underline, int fontSize, String fontName) {
-            this(text, bold, italic, underline, fontSize, fontName, false, -1, 0);
+            this(text, bold, italic, underline, fontSize, fontName, false, -1, 0, 0, 0, 0, 0, 0, 0);
         }
 
         /** 完整构造器（含表格来源信息） */
         public WordParagraph(String text, boolean bold, boolean italic,
                              boolean underline, int fontSize, String fontName,
                              boolean isTableRow, int tableIndex, int rowInTable) {
+            this(text, bold, italic, underline, fontSize, fontName,
+                    isTableRow, tableIndex, rowInTable, 0, 0, 0, 0, 0, 0);
+        }
+
+        /** 全参数构造器（含段落间距与缩进） */
+        public WordParagraph(String text, boolean bold, boolean italic,
+                             boolean underline, int fontSize, String fontName,
+                             boolean isTableRow, int tableIndex, int rowInTable,
+                             int spacingBetween, int spacingBefore, int spacingAfter,
+                             int indentLeft, int indentFirstLine, int alignment) {
             this.text = (text != null) ? text : "";
             this.bold = bold;
             this.italic = italic;
@@ -345,6 +463,12 @@ public class WordDocument {
             this.isTableRow = isTableRow;
             this.tableIndex = tableIndex;
             this.rowInTable = rowInTable;
+            this.spacingBetween = spacingBetween;
+            this.spacingBefore = spacingBefore;
+            this.spacingAfter = spacingAfter;
+            this.indentLeft = indentLeft;
+            this.indentFirstLine = indentFirstLine;
+            this.alignment = alignment;
         }
 
         // ======== Getters ========
@@ -372,6 +496,25 @@ public class WordDocument {
         public int getTableIndex()           { return tableIndex; }
         /** 在表格中的行号 (1-based)，非表格返回 0 */
         public int getRowInTable()           { return rowInTable; }
+
+        // ======== 段落间距 / 缩进 ========
+
+        /** 行间距 (twip, 1/20 pt)。0 = 使用默认值，AUTO 模式以负数标记 */
+        public int getSpacingBetween()       { return spacingBetween; }
+        /** 段前间距 (twip) */
+        public int getSpacingBefore()        { return spacingBefore; }
+        /** 段后间距 (twip) */
+        public int getSpacingAfter()         { return spacingAfter; }
+        /** 左缩进 (twip) */
+        public int getIndentLeft()           { return indentLeft; }
+        /** 首行缩进 (twip)，正=缩进，负=悬挂 */
+        public int getIndentFirstLine()      { return indentFirstLine; }
+        /** 对齐方式：0=left, 1=center, 2=right, 3=both */
+        public int getAlignment()            { return alignment; }
+        /** 是否有段落级缩进配置 */
+        public boolean hasIndent()           { return indentLeft != 0 || indentFirstLine != 0; }
+        /** 是否有段落间距配置 */
+        public boolean hasSpacing()          { return spacingBefore != 0 || spacingAfter != 0 || spacingBetween != 0; }
 
         // ======== 格式适配 ========
 
