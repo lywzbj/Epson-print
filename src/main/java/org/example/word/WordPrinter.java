@@ -460,11 +460,11 @@ public class WordPrinter {
     /**
      * 行间距 — ESC 3 n (n/216 英寸)。
      *
-     * <p>Word 的 getSpacingBetween() 在不同规则下的语义：
+     * <p>根据 Word 段落的 lineSpacingRule 正确解释 spacingBetween 值：
      * <ul>
-     *   <li>AUTO：返回值 = 240 × 倍率 (240=1.0倍行距, 360=1.5倍, 480=2倍)</li>
-     *   <li>EXACT：返回值 = 精确行距 (twip)</li>
-     *   <li>AT_LEAST：返回值 = 最小行距 (twip)</li>
+     *   <li>AUTO (0)：值 = 240 × 倍率 (240=单倍, 360=1.5倍, 480=2倍)</li>
+     *   <li>EXACT (1)：值 = 精确行距 (twip)</li>
+     *   <li>AT_LEAST (2)：值 = 最小行距 (twip)</li>
      * </ul>
      */
     private void applyParagraphLineSpacing(WordDocument.WordParagraph wp) throws IOException {
@@ -472,11 +472,11 @@ public class WordPrinter {
         if (sp <= 0) return;
 
         int n;
-        if (sp >= 200) {
-            // ≥200 → AUTO 模式: 240 = 1.0 倍 = 1/6" = 36/216"
+        if (wp.isAutoLineSpacing()) {
+            // AUTO 模式: 240 = 1.0 倍 = 1/6" = 36/216"
             n = sp * 36 / 240;
         } else {
-            // <200 → EXACT/AT_LEAST 模式: twip 直接换算
+            // EXACT/AT_LEAST 模式: twip 直接换算为 n/216"
             n = twipsTo216(sp);
         }
         if (n > 0 && n != currentLineSpacingN) {

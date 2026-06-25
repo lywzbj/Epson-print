@@ -164,14 +164,15 @@ public class WordDocument {
         }
 
         // -- 段落级格式 --
-        int spBetween, spBefore, spAfter;
+        int spBetween, spBefore, spAfter, lineRule;
         int indentL, indentFL;
         int alignCode;
 
-        // 行间距
-        spBetween = (int) para.getSpacingBetween();  // AUTO=240×倍率, EXACT/AT_LEAST=twip
-        spBefore  = (int) para.getSpacingBefore();   // twip
-        spAfter   = (int) para.getSpacingAfter();    // twip
+        // 行间距 — POI 返回 -1 表示继承自样式，需从样式链解析
+        spBetween = resolveParagraphSpacing(para, "line");
+        lineRule  = resolveParagraphLineRule(para);
+        spBefore  = resolveParagraphSpacing(para, "before");
+        spAfter   = resolveParagraphSpacing(para, "after");
 
         // 缩进
         indentL  = para.getIndentationLeft();       // twip
@@ -190,7 +191,8 @@ public class WordDocument {
         return new WordParagraph(text, isBold, isItalic, isUnderline,
                 maxFontSize, effectiveFont,
                 false, -1, 0,                                   // 非表格行
-                spBetween, spBefore, spAfter, indentL, indentFL, alignCode);
+                spBetween, lineRule,
+                spBefore, spAfter, indentL, indentFL, alignCode);
     }
 
     /**
@@ -211,12 +213,24 @@ public class WordDocument {
      * <p>run.getFontSize() 返回 -1 表示继承自段落/文档样式。
      * 此方法按以下优先级尝试获取实际字号：
      * <ol>
+     *   <li>段落自身的默认 Run 属性 (w:pPr/w:rPr)</li>
      *   <li>段落的 styleID → 文档 styles.xml 中该样式的 rPr/sz 定义</li>
+     *   <li>样式继承链 (basedOn 追溯)</li>
+     *   <li>文档默认样式 (w:docDefaults/w:rPrDefault)</li>
      *   <li>硬编码回退: 24 half-points = 12pt (Word 正文默认)</li>
      * </ol>
      */
     private int resolveDefaultFontSize(XWPFParagraph para) {
-        // 1. 通过段落样式 ID 查找文档 styles.xml 中的字号
+        // 1. 从段落自身的默认 Run 属性获取 (w:pPr/w:rPr)
+        try {
+            if (para.getCTP().getPPr() != null) {
+                int sz = extractFontSizeFromRPrXml(para.getCTP().getPPr().toString());
+                if (sz > 0) return sz;
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 2. 通过段落样式 ID 查找文档 styles.xml 中的字号
         try {
             String styleId = para.getStyleID();
             if (styleId != null) {
@@ -244,30 +258,290 @@ public class WordDocument {
         } catch (Exception ignored) {
         }
 
-        // 2. 回退：24 half-points = 12pt
+        // 3. 从文档默认样式 (w:docDefaults/w:rPrDefault/w:rPr) 获取
+        try {
+            XWPFDocument doc = para.getDocument();
+            // POI 5.2.5: XWPFStyles 无 getCTStyles()，
+            // 通过 OPCPackage 直接读取 styles 部件的原始 XML
+            String stylesXml = readStylesXml(doc);
+            if (stylesXml != null) {
+                // 在 styles.xml 中定位 docDefaults/rPrDefault/rPr 区域内的 sz 定义
+                java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                        "<w:docDefaults>[\\s\\S]*?<w:rPrDefault>[\\s\\S]*?<w:rPr[\\s>]",
+                        java.util.regex.Pattern.DOTALL);
+                java.util.regex.Matcher dm = p.matcher(stylesXml);
+                if (dm.find()) {
+                    // 从匹配位置开始找第一个 sz/szCs
+                    String section = stylesXml.substring(dm.start());
+                    // 限制搜索范围: 不超过 </w:rPrDefault> 或 2000 字符
+                    int endIdx = section.indexOf("</w:rPrDefault>");
+                    if (endIdx < 0) endIdx = Math.min(2000, section.length());
+                    section = section.substring(0, endIdx);
+                    int sz = extractFontSizeFromRPrXml(section);
+                    if (sz > 0) return sz;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        // 4. 回退：24 half-points = 12pt
         return 24;
+    }
+
+    /**
+     * 从 CTRPr XML 中提取字号 (half-points)，提取不到返回 -1。
+     *
+     * <p>POI 的 {@code CTRPr.toString()} 输出格式为 {@code <w:sz w:val="24"/>}，
+     * 值在 {@code w:val} 属性中，单位已是 half-points（如 12pt → 24）。
+     * 同时也匹配 {@code w:szCs} (complex script font size，中文文档常用)。
+     */
+    private static int extractFontSizeFromRPrXml(String rprXml) {
+        if (rprXml == null || rprXml.isEmpty()) return -1;
+        // 匹配 <w:sz w:val="24"/> 或 <w:szCs w:val="24"/>
+        // 格式: w:sz[Cs] 空格 若干属性... w:val="数字"
+        java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                "w:sz(?:Cs)?\\s[^>]*w:val=\"(\\d+)\"");
+        java.util.regex.Matcher m = p.matcher(rprXml);
+        if (m.find()) {
+            // w:val 的值就是 half-points（OOXML 标准），直接返回
+            return Integer.parseInt(m.group(1));
+        }
+        return -1;
+    }
+
+    /**
+     * POI 5.2.5 兼容方式读取 styles.xml 原始内容。
+     * XWPFStyles 没有暴露 getCTStyles()，所以通过 OPCPackage 遍历 parts 查找。
+     */
+    private String readStylesXml(XWPFDocument doc) {
+        try {
+            for (Object obj : doc.getPackage().getParts()) {
+                org.apache.poi.openxml4j.opc.PackagePart part =
+                        (org.apache.poi.openxml4j.opc.PackagePart) obj;
+                if (part.getPartName().getName().endsWith("/styles.xml")) {
+                    try (java.io.InputStream is = part.getInputStream()) {
+                        byte[] bytes = is.readAllBytes();
+                        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
     }
 
     /** 从 XWPFStyle 中提取 Run 级字号 (half-points)，提取不到返回 -1 */
     private int extractFontSizeFromStyle(XWPFStyle style) {
         try {
             if (style.getCTStyle().getRPr() == null) return -1;
-            // CTRPr 的 sz 属性 (half-points，如 24=12pt, 32=16pt, 44=22pt)
-            // 不同 POI 版本此元素的访问方式不同，通过 XML toString 安全提取
-            String rprXml = style.getCTStyle().getRPr().toString();
-            // 匹配 w:sz="320" 或 w:szCs="320" (单位: half-points × 10, POI 内部 × 10)
-            java.util.regex.Pattern p = java.util.regex.Pattern.compile(
-                    "w:sz(?:Cs)?=\"(\\d+)\"");
-            java.util.regex.Matcher m = p.matcher(rprXml);
-            if (m.find()) {
-                int val = Integer.parseInt(m.group(1));
-                // sz 在 XML 中存储为 half-points × 10 (如 12pt → 120)
-                // run.getFontSize() 返回 half-points (如 12pt → 24)
-                // 统一转换: XML 值 / 10 * 2 = half-points
-                return val / 5;
-            }
+            return extractFontSizeFromRPrXml(style.getCTStyle().getRPr().toString());
         } catch (Exception ignored) {
         }
+        return -1;
+    }
+
+    // ================================================================
+    // 段落间距解析（含样式继承）
+    // ================================================================
+
+    /**
+     * 解析段落间距值（before/after/line），当段落直接值为 -1 时从样式链获取。
+     *
+     * <p>优先级：段落直接值 → 段落样式 pPr → basedOn 链 → docDefaults → 0
+     *
+     * @param para  POI 段落对象
+     * @param which "before", "after", "line"
+     * @return 解析后的间距值，未设置返回 0
+     */
+    private int resolveParagraphSpacing(XWPFParagraph para, String which) {
+        // 1. 段落直接值
+        int direct = getSpacingDirect(para, which);
+        if (direct >= 0) return direct;  // 0 = 显式设为 0
+
+        // 2. 从样式链解析
+        int fromStyle = resolveParagraphSpacingFromStyle(para, which);
+        if (fromStyle >= 0) return fromStyle;
+
+        // 3. 从 docDefaults 解析
+        int fromDefaults = resolveSpacingFromDocDefaults(para, which);
+        if (fromDefaults >= 0) return fromDefaults;
+
+        // 4. 回退
+        return 0;
+    }
+
+    /** 获取段落直接间距值，-1 表示未设置 */
+    private int getSpacingDirect(XWPFParagraph para, String which) {
+        switch (which) {
+            case "before": return (int) para.getSpacingBefore();
+            case "after":  return (int) para.getSpacingAfter();
+            case "line":   return (int) para.getSpacingBetween();
+            default:       return -1;
+        }
+    }
+
+    /**
+     * 解析行距规则。
+     * 优先级同 resolveParagraphSpacing，默认返回 0 (AUTO)。
+     */
+    private int resolveParagraphLineRule(XWPFParagraph para) {
+        // 1. 段落直接值
+        try {
+            LineSpacingRule lsr = para.getSpacingLineRule();
+            // POI 未设置时默认返回 AUTO，需要区分"显式设为 AUTO"和"继承"
+            // 通过检查段落 pPr 是否有 spacing/lineRule 来判断
+            if (para.getCTP().getPPr() != null
+                    && para.getCTP().getPPr().getSpacing() != null
+                    && para.getCTP().getPPr().getSpacing().isSetLineRule()) {
+                return ruleCode(lsr);
+            }
+        } catch (Exception ignored) {}
+
+        // 2. 从样式链解析
+        int fromStyle = resolveLineRuleFromStyle(para);
+        if (fromStyle >= 0) return fromStyle;
+
+        // 3. 默认 AUTO
+        return 0;
+    }
+
+    /** LineSpacingRule → int code: AUTO=0, EXACT=1, AT_LEAST=2 */
+    private static int ruleCode(LineSpacingRule r) {
+        if (r == null) return 0;
+        switch (r) {
+            case EXACT:    return 1;
+            case AT_LEAST: return 2;
+            default:       return 0;  // AUTO
+        }
+    }
+
+    /** 从样式链解析间距值 */
+    private int resolveParagraphSpacingFromStyle(XWPFParagraph para, String which) {
+        try {
+            String styleId = para.getStyleID();
+            if (styleId == null) return -1;
+            XWPFDocument doc = para.getDocument();
+            XWPFStyles styles = doc.getStyles();
+            XWPFStyle style = styles.getStyle(styleId);
+
+            for (int level = 0; level < 6 && style != null; level++) {
+                int val = extractSpacingFromStylePPr(style, which);
+                if (val >= 0) return val;
+
+                // follow basedOn
+                String baseId = style.getCTStyle().getBasedOn() != null
+                        ? style.getCTStyle().getBasedOn().getVal() : null;
+                if (baseId == null) break;
+                style = styles.getStyle(baseId);
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    /** 从样式链解析行距规则 */
+    private int resolveLineRuleFromStyle(XWPFParagraph para) {
+        try {
+            String styleId = para.getStyleID();
+            if (styleId == null) return -1;
+            XWPFDocument doc = para.getDocument();
+            XWPFStyles styles = doc.getStyles();
+            XWPFStyle style = styles.getStyle(styleId);
+
+            for (int level = 0; level < 6 && style != null; level++) {
+                int val = extractSpacingFromStylePPr(style, "lineRule");
+                if (val >= 0) return val;
+
+                String baseId = style.getCTStyle().getBasedOn() != null
+                        ? style.getCTStyle().getBasedOn().getVal() : null;
+                if (baseId == null) break;
+                style = styles.getStyle(baseId);
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    /**
+     * 从 XWPFStyle 的 pPr/spacing 中提取间距值。
+     * @param which "before", "after", "line", "lineRule"
+     * @return 间距值，未设置返回 -1
+     */
+    private int extractSpacingFromStylePPr(XWPFStyle style, String which) {
+        try {
+            if (style.getCTStyle().getPPr() == null) return -1;
+            if (style.getCTStyle().getPPr().getSpacing() == null) return -1;
+            org.openxmlformats.schemas.wordprocessingml.x2006.main.CTSpacing sp =
+                    style.getCTStyle().getPPr().getSpacing();
+
+            switch (which) {
+                case "before":
+                    return sp.isSetBefore() ? parseObjToInt(sp.getBefore()) : -1;
+                case "after":
+                    return sp.isSetAfter() ? parseObjToInt(sp.getAfter()) : -1;
+                case "line":
+                    return sp.isSetLine() ? parseObjToInt(sp.getLine()) : -1;
+                case "lineRule":
+                    if (sp.isSetLineRule()) {
+                        // getLineRule() 返回 STLineSpacingRule.Enum 或 String
+                        String name = sp.getLineRule().toString();
+                        return ruleCode(LineSpacingRule.valueOf(name));
+                    }
+                    return -1;
+            }
+        } catch (Exception ignored) {}
+        return -1;
+    }
+
+    /** 安全地将 CTSpacing getter 返回的 Object 转为 int */
+    private static int parseObjToInt(Object obj) {
+        if (obj == null) return -1;
+        if (obj instanceof Number) return ((Number) obj).intValue();
+        try { return Integer.parseInt(obj.toString()); } catch (NumberFormatException e) { return -1; }
+    }
+
+    /** 从 docDefaults 的 pPrDefault/spacing 中提取间距值 */
+    private int resolveSpacingFromDocDefaults(XWPFParagraph para, String which) {
+        try {
+            String stylesXml = readStylesXml(para.getDocument());
+            if (stylesXml == null) return -1;
+
+            // 定位 docDefaults/pPrDefault/pPr 区域
+            java.util.regex.Pattern p = java.util.regex.Pattern.compile(
+                    "<w:docDefaults>[\\s\\S]*?<w:pPrDefault>[\\s\\S]*?<w:pPr[\\s>]",
+                    java.util.regex.Pattern.DOTALL);
+            java.util.regex.Matcher dm = p.matcher(stylesXml);
+            if (!dm.find()) return -1;
+
+            String section = stylesXml.substring(dm.start());
+            int endIdx = section.indexOf("</w:pPrDefault>");
+            if (endIdx < 0) endIdx = Math.min(2000, section.length());
+            section = section.substring(0, endIdx);
+
+            // 定位 <w:spacing ... />
+            java.util.regex.Pattern spP = java.util.regex.Pattern.compile(
+                    "<w:spacing\\s([^>]*)>");
+            java.util.regex.Matcher spM = spP.matcher(section);
+            if (!spM.find()) return -1;
+
+            String attrs = spM.group(1);
+            // 匹配对应属性: w:before="120", w:after="120", w:line="240", w:lineRule="auto"
+            switch (which) {
+                case "before": {
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                            "w:before=\"(\\d+)\"").matcher(attrs);
+                    return m.find() ? Integer.parseInt(m.group(1)) : -1;
+                }
+                case "after": {
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                            "w:after=\"(\\d+)\"").matcher(attrs);
+                    return m.find() ? Integer.parseInt(m.group(1)) : -1;
+                }
+                case "line": {
+                    java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                            "w:line=\"(\\d+)\"").matcher(attrs);
+                    return m.find() ? Integer.parseInt(m.group(1)) : -1;
+                }
+            }
+        } catch (Exception ignored) {}
         return -1;
     }
 
@@ -413,8 +687,10 @@ public class WordDocument {
         private final int rowInTable;      // 在表格中的行号 (1-based), 非表格=0
 
         // 段落间距与缩进（从 Word 段落属性提取）
-        /** 行间距 (twip, 1/20 pt)。0 = 使用默认 */
+        /** 行间距值。AUTO 模式 = 240×倍率, EXACT/AT_LEAST = twip。0 = 使用默认 */
         private final int spacingBetween;
+        /** 行距规则：0=AUTO(倍数), 1=EXACT(精确值), 2=AT_LEAST(最小值)。对齐 Word LineSpacingRule */
+        private final int lineSpacingRule;
         /** 段前间距 (twip) */
         private final int spacingBefore;
         /** 段后间距 (twip) */
@@ -432,12 +708,12 @@ public class WordDocument {
 
         /** 空段落 */
         public WordParagraph(String text) {
-            this(text, false, false, false, 0, null, false, -1, 0, 0, 0, 0, 0, 0, 0);
+            this(text, false, false, false, 0, null, false, -1, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         public WordParagraph(String text, boolean bold, boolean italic,
                              boolean underline, int fontSize, String fontName) {
-            this(text, bold, italic, underline, fontSize, fontName, false, -1, 0, 0, 0, 0, 0, 0, 0);
+            this(text, bold, italic, underline, fontSize, fontName, false, -1, 0, 0, 0, 0, 0, 0, 0, 0);
         }
 
         /** 完整构造器（含表格来源信息） */
@@ -445,7 +721,7 @@ public class WordDocument {
                              boolean underline, int fontSize, String fontName,
                              boolean isTableRow, int tableIndex, int rowInTable) {
             this(text, bold, italic, underline, fontSize, fontName,
-                    isTableRow, tableIndex, rowInTable, 0, 0, 0, 0, 0, 0);
+                    isTableRow, tableIndex, rowInTable, 0, 0, 0, 0, 0, 0, 0);
         }
 
         /** 全参数构造器（含段落间距与缩进） */
@@ -453,6 +729,19 @@ public class WordDocument {
                              boolean underline, int fontSize, String fontName,
                              boolean isTableRow, int tableIndex, int rowInTable,
                              int spacingBetween, int spacingBefore, int spacingAfter,
+                             int indentLeft, int indentFirstLine, int alignment) {
+            this(text, bold, italic, underline, fontSize, fontName,
+                    isTableRow, tableIndex, rowInTable,
+                    spacingBetween, 0, spacingBefore, spacingAfter,
+                    indentLeft, indentFirstLine, alignment);
+        }
+
+        /** 全参数构造器 + 行距规则 */
+        public WordParagraph(String text, boolean bold, boolean italic,
+                             boolean underline, int fontSize, String fontName,
+                             boolean isTableRow, int tableIndex, int rowInTable,
+                             int spacingBetween, int lineSpacingRule,
+                             int spacingBefore, int spacingAfter,
                              int indentLeft, int indentFirstLine, int alignment) {
             this.text = (text != null) ? text : "";
             this.bold = bold;
@@ -464,6 +753,7 @@ public class WordDocument {
             this.tableIndex = tableIndex;
             this.rowInTable = rowInTable;
             this.spacingBetween = spacingBetween;
+            this.lineSpacingRule = lineSpacingRule;
             this.spacingBefore = spacingBefore;
             this.spacingAfter = spacingAfter;
             this.indentLeft = indentLeft;
@@ -499,8 +789,12 @@ public class WordDocument {
 
         // ======== 段落间距 / 缩进 ========
 
-        /** 行间距 (twip, 1/20 pt)。0 = 使用默认值，AUTO 模式以负数标记 */
+        /** 行间距 (twip, 1/20 pt)。0 = 使用默认值，AUTO 模式以 240 为倍率基数 */
         public int getSpacingBetween()       { return spacingBetween; }
+        /** 行距规则：0=AUTO(倍数), 1=EXACT(精确twip), 2=AT_LEAST(最小twip) */
+        public int getLineSpacingRule()       { return lineSpacingRule; }
+        /** 是否为倍数行距 (AUTO 模式) */
+        public boolean isAutoLineSpacing()    { return lineSpacingRule == 0; }
         /** 段前间距 (twip) */
         public int getSpacingBefore()        { return spacingBefore; }
         /** 段后间距 (twip) */

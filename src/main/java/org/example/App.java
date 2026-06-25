@@ -36,7 +36,7 @@ public class App {
         try {
             printer.open();
             // 【示例】打印第 1 页，跳过前 2 行并留白进纸
-            printPageSkipWithBlank(printer, DEFAULT_FILE, 1, 2);
+            printPageSkipWithBlank(printer, DEFAULT_FILE, 1, 0);
 
         } catch (IOException e) {
             System.err.println("打印出错: " + e.getMessage());
