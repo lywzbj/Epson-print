@@ -398,6 +398,20 @@ public class PrintConfig {
             return this;
         }
 
+        /**
+         * 从文档页面布局自动填充纸张和边距。
+         * 边距按 6LPI/10CPI 换算为行数和列数。
+         */
+        public Builder fromPageLayout(org.example.word.DocPageLayout pl) {
+            if (pl != null) {
+                this.physicalPaper = pl.toPaperSize();
+                this.topMargin = pl.topMarginLines(6);
+                this.bottomMargin = pl.bottomMarginLines(6);
+                this.leftMargin = pl.leftMarginCols(10);
+            }
+            return this;
+        }
+
         // -- 字符间距 --
 
         /** 设置 CPI (10 / 12 / 15) */

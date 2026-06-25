@@ -1,10 +1,14 @@
 package org.example.word;
 
 import org.apache.poi.xwpf.usermodel.*;
+import org.apache.poi.xwpf.model.XWPFHeaderFooterPolicy;
+import org.apache.poi.openxml4j.opc.PackagePart;
+import org.example.config.PrintConfig;
 
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -28,6 +32,9 @@ public class WordDocument {
     private final String filePath;
     private final List<WordParagraph> paragraphs;
     private int linesPerPage;
+    private DocPageLayout pageLayout;
+    private String headerText;
+    private String footerText;
 
     private WordDocument(String filePath, int linesPerPage) {
         this.filePath = filePath;
@@ -75,7 +82,14 @@ public class WordDocument {
 
     private void parse(InputStream in) throws IOException {
         paragraphs.clear();
+        pageLayout = null;
+        headerText = null;
+        footerText = null;
         XWPFDocument doc = new XWPFDocument(in);
+
+        // 提取文档级页面布局和页眉/页脚
+        extractPageLayout(doc);
+        extractHeadersFooters(doc);
 
         int tableCount = 0;  // 当前表格序号 (0-based)
 
@@ -311,17 +325,56 @@ public class WordDocument {
 
     /**
      * POI 5.2.5 兼容方式读取 styles.xml 原始内容。
-     * XWPFStyles 没有暴露 getCTStyles()，所以通过 OPCPackage 遍历 parts 查找。
      */
     private String readStylesXml(XWPFDocument doc) {
+        return readPartXml(doc, "/word/styles.xml");
+    }
+
+    // ================================================================
+    // 页面布局提取
+    // ================================================================
+
+    /**
+     * 从 DOCX 的 section properties 提取页面尺寸和边距。
+     * 通过 OPCPackage 读取 word/document.xml，解析 {@code <w:sectPr>} 区域。
+     */
+    private void extractPageLayout(XWPFDocument doc) {
+        try {
+            // 读取 word/document.xml
+            String docXml = readPartXml(doc, "/word/document.xml");
+            if (docXml == null) return;
+
+            // 定位 <w:sectPr> 区域（文档级 section，通常在文件末尾）
+            int sectIdx = docXml.lastIndexOf("<w:sectPr");
+            if (sectIdx < 0) { sectIdx = docXml.indexOf("<w:sectPr"); }
+            if (sectIdx < 0) return;  // 没有 section properties
+
+            // 取 sectPr 片段（到 </w:sectPr> 为止）
+            int endIdx = docXml.indexOf("</w:sectPr>", sectIdx);
+            if (endIdx < 0) endIdx = docXml.indexOf("/>", sectIdx);
+            if (endIdx < 0) endIdx = Math.min(sectIdx + 2000, docXml.length());
+            else endIdx += "</w:sectPr>".length();
+
+            String sectPrXml = docXml.substring(sectIdx, endIdx);
+            this.pageLayout = DocPageLayout.fromSectPrXml(sectPrXml);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * 通过 OPCPackage 读取 DOCX 中指定 URI 的部件内容。
+     * @param doc     XWPFDocument
+     * @param uri     部件 URI（如 "/word/document.xml", "/word/styles.xml"）
+     * @return XML 字符串，失败返回 null
+     */
+    private String readPartXml(XWPFDocument doc, String uri) {
         try {
             for (Object obj : doc.getPackage().getParts()) {
-                org.apache.poi.openxml4j.opc.PackagePart part =
-                        (org.apache.poi.openxml4j.opc.PackagePart) obj;
-                if (part.getPartName().getName().endsWith("/styles.xml")) {
-                    try (java.io.InputStream is = part.getInputStream()) {
+                PackagePart part = (PackagePart) obj;
+                if (part.getPartName().getName().equals(uri)) {
+                    try (InputStream is = part.getInputStream()) {
                         byte[] bytes = is.readAllBytes();
-                        return new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                        return new String(bytes, StandardCharsets.UTF_8);
                     }
                 }
             }
@@ -329,6 +382,100 @@ public class WordDocument {
         }
         return null;
     }
+
+    // ================================================================
+    // 页眉/页脚提取
+    // ================================================================
+
+    /** 提取默认页眉/页脚的纯文本 */
+    private void extractHeadersFooters(XWPFDocument doc) {
+        try {
+            XWPFHeaderFooterPolicy hfPolicy = doc.getHeaderFooterPolicy();
+            if (hfPolicy == null) return;
+
+            // 默认页眉
+            XWPFHeader header = hfPolicy.getDefaultHeader();
+            if (header != null) {
+                this.headerText = extractBodyText(header);
+            }
+            // 首页页眉（如果默认页眉为空）
+            if ((this.headerText == null || this.headerText.isEmpty())
+                    && hfPolicy.getFirstPageHeader() != null) {
+                this.headerText = extractBodyText(hfPolicy.getFirstPageHeader());
+            }
+
+            // 默认页脚
+            XWPFFooter footer = hfPolicy.getDefaultFooter();
+            if (footer != null) {
+                this.footerText = extractBodyText(footer);
+            }
+            if ((this.footerText == null || this.footerText.isEmpty())
+                    && hfPolicy.getFirstPageFooter() != null) {
+                this.footerText = extractBodyText(hfPolicy.getFirstPageFooter());
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** 从 IBody (页眉/页脚) 中提取纯文本 */
+    private String extractBodyText(IBody body) {
+        StringBuilder sb = new StringBuilder();
+        for (IBodyElement element : body.getBodyElements()) {
+            if (element instanceof XWPFParagraph) {
+                String t = extractText((XWPFParagraph) element);
+                if (!t.isEmpty()) {
+                    if (sb.length() > 0) sb.append(" ");
+                    sb.append(t);
+                }
+            } else if (element instanceof XWPFTable) {
+                for (XWPFTableRow row : ((XWPFTable) element).getRows()) {
+                    for (XWPFTableCell cell : row.getTableCells()) {
+                        for (XWPFParagraph cp : cell.getParagraphs()) {
+                            String t = extractText(cp);
+                            if (!t.isEmpty()) {
+                                if (sb.length() > 0) sb.append(" | ");
+                                sb.append(t);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return sb.toString().trim();
+    }
+
+    // ================================================================
+    // 页面信息 getter
+    // ================================================================
+
+    /** 文档页面布局信息（纸张尺寸、页边距等），可能为 null */
+    public DocPageLayout getPageLayout() { return pageLayout; }
+
+    /** 页眉纯文本，无页眉时为 null */
+    public String getHeaderText() { return headerText; }
+
+    /** 页脚纯文本，无页脚时为 null */
+    public String getFooterText() { return footerText; }
+
+    /**
+     * 从文档页面属性自动生成打印配置。
+     * 边距转换为 ESC/P 可用的行数和列数。
+     */
+    public PrintConfig derivePrintConfig() {
+        DocPageLayout pl = (pageLayout != null) ? pageLayout : DocPageLayout.defaults();
+        return PrintConfig.builder()
+                .physicalPaper(pl.toPaperSize())
+                .topMargin(pl.topMarginLines(6))
+                .bottomMargin(Math.max(1, pl.bottomMarginLines(6)))
+                .leftMargin(pl.leftMarginCols(10))
+                .cpi(10)
+                .lineSpacing(PrintConfig.LineSpacing.ONE_SIXTH)
+                .build();
+    }
+
+    // ================================================================
+    // 样式字号提取（续）
+    // ================================================================
 
     /** 从 XWPFStyle 中提取 Run 级字号 (half-points)，提取不到返回 -1 */
     private int extractFontSizeFromStyle(XWPFStyle style) {

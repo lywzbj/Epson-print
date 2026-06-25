@@ -109,10 +109,12 @@ public class App {
         System.out.println("  文件: " + filePath);
         System.out.println("==========================================");
 
-        PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
-
         WordDocument doc = WordDocument.load(filePath);
+
+        // 使用文档页面属性自动生成打印配置
+        PrintConfig config = doc.derivePrintConfig();
+        printer.applyConfig(config);
+        System.out.println("  配置: " + config);
 
         int pageBase = (page - 1) * doc.getLinesPerPage();
         int pageStart = pageBase + 1;
@@ -217,11 +219,21 @@ public class App {
         System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落, "
                 + doc.getTableCount() + " 个表格");
 
+        // 输出文档页面信息
+        if (doc.getPageLayout() != null) {
+            System.out.println("  页面布局: " + doc.getPageLayout());
+        }
+        if (doc.getHeaderText() != null) {
+            System.out.println("  页眉: " + doc.getHeaderText());
+        }
+        if (doc.getFooterText() != null) {
+            System.out.println("  页脚: " + doc.getFooterText());
+        }
+
         // 创建预览记录器
         PrintPreview preview = new PrintPreview(filePath);
         WordPrinter wordPrinter = new WordPrinter(null, false); // verbose=false
-        wordPrinter.generatePreview(doc, null, preview);  // 全部内容
-        // 或带选择器: wordPrinter.generatePreview(doc, selector, preview);
+        wordPrinter.generatePreview(doc, null, preview);  // 全部内容，自动传递页面布局
 
         // 写出 HTML
         preview.writeHtml(outputPath);

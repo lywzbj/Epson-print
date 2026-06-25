@@ -300,6 +300,9 @@ public class PrinterService {
             send(EscpCommand.setLeftMargin(config.getLeftMargin()));
         }
 
+        // 5b. 顶部边距 — ESC/P 无原生上边距命令，用 ESC J 进纸实现
+        applyTopMargin(config.getTopMargin());
+
         // 6. CPI
         switch (config.getCpi()) {
             case 10: send(EscpCommand.select10CPI()); break;
@@ -337,6 +340,22 @@ public class PrinterService {
     }
 
     /**
+     * 顶部边距 — 通过 ESC J 进纸模拟（ESC/P 无原生上边距命令）。
+     *
+     * @param lines 上边距占用的行数 (1 行 = 1/6" = 36/216")
+     */
+    public void applyTopMargin(int lines) throws IOException {
+        if (lines <= 0) return;
+        int n = lines * 36;  // 行数 → n/216"
+        // ESC J n 参数为单字节 (0-255)，大边距需分段
+        while (n > 255) {
+            send(EscpCommand.feedPaper216(255));
+            n -= 255;
+        }
+        if (n > 0) send(EscpCommand.feedPaper216(n));
+    }
+
+    /**
      * 进入汉字模式并应用配置中的汉字设置。
      * 适用于需要连续打印多行汉字的场景。
      */
@@ -369,6 +388,8 @@ public class PrinterService {
         if (config.getPageLayout().isMultiUp()) {
             send(EscpCommand.setPageLength(config.getPhysicalPaper().pageLengthInLines()));
         }
+        // 每张物理纸开始时发送顶部留白
+        applyTopMargin(config.getTopMargin());
     }
 
     /**

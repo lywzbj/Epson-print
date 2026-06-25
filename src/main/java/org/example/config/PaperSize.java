@@ -43,6 +43,11 @@ public enum PaperSize {
     /** 纸张高度 (mm) */
     private final int heightMM;
 
+    /** 最近一次 custom() 设置的宽度 (mm) */
+    private static int customWidthMM;
+    /** 最近一次 custom() 设置的高度 (mm) */
+    private static int customHeightMM;
+
     PaperSize(int widthMM, int heightMM) {
         this.widthMM = widthMM;
         this.heightMM = heightMM;
@@ -53,10 +58,12 @@ public enum PaperSize {
     // ================================================================
 
     public int getWidthMM() {
+        if (this == CUSTOM) return customWidthMM;
         return widthMM;
     }
 
     public int getHeightMM() {
+        if (this == CUSTOM) return customHeightMM;
         return heightMM;
     }
 
@@ -118,11 +125,12 @@ public enum PaperSize {
      * 创建自定义纸张尺寸。
      * @param widthMM  宽度 (mm)
      * @param heightMM 高度 (mm)
-     * @return 设置了尺寸的 CUSTOM 枚举值 (注意: 枚举单例限制，此方法修改 CUSTOM 的内部状态)
+     * @return 设置了尺寸的 CUSTOM 枚举值
      */
     public static PaperSize custom(int widthMM, int heightMM) {
-        return CUSTOM; // 调用者需自行使用 getWidthMM/getHeightMM 获取传入值
-        // 注意: 枚举无法动态创建新实例，实际使用中建议用 PrintConfig 的 customPaperSize 字段
+        customWidthMM = widthMM;
+        customHeightMM = heightMM;
+        return CUSTOM;
     }
 
     // ================================================================

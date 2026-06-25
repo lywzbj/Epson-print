@@ -1,5 +1,6 @@
 package org.example.preview;
 
+import org.example.word.DocPageLayout;
 import org.example.word.WordDocument.WordParagraph;
 
 import java.io.BufferedWriter;
@@ -29,10 +30,24 @@ public class PrintPreview {
     private final String sourceFile;
     private final List<RecordedLine> lines;
     private String htmlPath;
+    private DocPageLayout pageLayout;
+    private String headerText;
+    private String footerText;
 
     public PrintPreview(String sourceFile) {
         this.sourceFile = sourceFile;
         this.lines = new ArrayList<>();
+    }
+
+    /** 设置文档页面布局（纸张尺寸、页边距），影响 HTML 页面渲染 */
+    public void setPageLayout(DocPageLayout pl) {
+        this.pageLayout = pl;
+    }
+
+    /** 设置页眉/页脚文本 */
+    public void setHeaderFooter(String h, String f) {
+        this.headerText = h;
+        this.footerText = f;
     }
 
     // ================================================================
@@ -69,6 +84,16 @@ public class PrintPreview {
     public void writeHtml(String outputPath) throws IOException {
         StringBuilder html = new StringBuilder(16 * 1024);
 
+        // 从文档页面布局获取尺寸，无布局时回退到 A4 默认
+        int pageW = (pageLayout != null) ? pageLayout.pageWidthMm() : 210;
+        int pageH = (pageLayout != null) ? pageLayout.pageHeightMm() : 297;
+        int padT = (pageLayout != null) ? pageLayout.marginTopMm() : 15;
+        int padR = (pageLayout != null) ? pageLayout.marginRightMm() : 20;
+        int padB = (pageLayout != null) ? pageLayout.marginBottomMm() : 15;
+        int padL = (pageLayout != null) ? pageLayout.marginLeftMm() : 25;
+        int linesPerPage = (pageLayout != null) ? pageLayout.printableLines(6) : 55;
+        if (linesPerPage < 10) linesPerPage = 55;  // safety
+
         html.append("<!DOCTYPE html>\n<html lang=\"zh-CN\">\n<head>\n")
             .append("<meta charset=\"UTF-8\">\n")
             .append("<title>打印预览 — ").append(escapeHtml(sourceFile)).append("</title>\n")
@@ -76,9 +101,19 @@ public class PrintPreview {
             .append("  * { margin:0; padding:0; box-sizing:border-box; }\n")
             .append("  body { font-family:'Microsoft YaHei','SimSun',sans-serif; ")
             .append("background:#f5f5f5; padding:20px; }\n")
-            .append("  .page { width:210mm; min-height:297mm; margin:0 auto 30px; ")
+            .append("  .page { width:").append(pageW).append("mm; ")
+            .append("min-height:").append(pageH).append("mm; margin:0 auto 30px; ")
             .append("background:#fff; box-shadow:0 0 8px rgba(0,0,0,.15); ")
-            .append("padding:15mm 20mm 15mm 25mm; position:relative; }\n")
+            .append("padding:").append(padT).append("mm ").append(padR).append("mm ")
+            .append(padB).append("mm ").append(padL).append("mm; position:relative; }\n")
+            .append("  .page-top-header { position:absolute; top:3mm; left:")
+            .append(padL).append("mm; right:").append(padR).append("mm; ")
+            .append("border-bottom:1px solid #ccc; padding-bottom:4px; ")
+            .append("color:#888; font-size:10px; text-align:center; }\n")
+            .append("  .page-bottom-footer { position:absolute; bottom:3mm; left:")
+            .append(padL).append("mm; right:").append(padR).append("mm; ")
+            .append("border-top:1px solid #ccc; padding-top:4px; ")
+            .append("color:#888; font-size:10px; text-align:center; }\n")
             .append("  .page-header { border-bottom:1px solid #ccc; margin-bottom:12px; ")
             .append("padding-bottom:8px; color:#666; font-size:11px; }\n")
             .append("  .line { white-space:pre-wrap; word-break:break-all; ")
@@ -100,19 +135,23 @@ public class PrintPreview {
             .append("  .line .tag.indent { background:#b2dfdb; color:#333; }\n")
             .append("  .line .tag.align { background:#d1c4e9; color:#333; }\n")
             .append("  .separator { border-top:1px dashed #ddd; margin:4px 0; }\n")
-            .append("  .summary { max-width:210mm; margin:0 auto; color:#666; ")
-            .append("font-size:12px; }\n")
+            .append("  .summary { max-width:").append(pageW).append("mm; margin:0 auto; ")
+            .append("color:#666; font-size:12px; }\n")
             .append("</style>\n</head>\n<body>\n");
 
-        // 分页 (A4 每页约 66 行，但 HTML 预览按约 55 行/页来分以适配边距)
-        int linesPerPage = 55;
         int pageNum = 1;
         int lineOnPage = 0;
 
         html.append("<div class=\"page\">\n");
+        // 页眉
+        if (headerText != null && !headerText.isEmpty()) {
+            html.append("<div class=\"page-top-header\">")
+                .append(escapeHtml(headerText)).append("</div>\n");
+        }
         html.append("<div class=\"page-header\">")
             .append("文件: ").append(escapeHtml(sourceFile))
             .append(" &nbsp;|&nbsp; 第 ").append(pageNum).append(" 页")
+            .append(" &nbsp;|&nbsp; ").append(pageW).append("×").append(pageH).append("mm")
             .append(" &nbsp;|&nbsp; 共 ").append(lines.size()).append(" 行")
             .append("</div>\n");
 
@@ -126,9 +165,19 @@ public class PrintPreview {
 
             lineOnPage++;
             if (lineOnPage > linesPerPage) {
+                // 页脚
+                if (footerText != null && !footerText.isEmpty()) {
+                    html.append("<div class=\"page-bottom-footer\">")
+                        .append(escapeHtml(footerText)).append("</div>\n");
+                }
                 html.append("</div>\n<div class=\"page\">\n");
                 pageNum++;
                 lineOnPage = 1;
+                // 页眉
+                if (headerText != null && !headerText.isEmpty()) {
+                    html.append("<div class=\"page-top-header\">")
+                        .append(escapeHtml(headerText)).append("</div>\n");
+                }
                 html.append("<div class=\"page-header\">")
                     .append("文件: ").append(escapeHtml(sourceFile))
                     .append(" &nbsp;|&nbsp; 第 ").append(pageNum).append(" 页")
@@ -203,11 +252,20 @@ public class PrintPreview {
             html.append("</div>\n");
         }
 
+        // 最后一页的页脚
+        if (footerText != null && !footerText.isEmpty()) {
+            html.append("<div class=\"page-bottom-footer\">")
+                .append(escapeHtml(footerText)).append("</div>\n");
+        }
         html.append("</div>\n");  // close last page
 
         // 底部摘要
         html.append("<div class=\"summary\">\n");
         html.append("  <p>文件: ").append(escapeHtml(sourceFile)).append("<br>\n");
+        html.append("  纸张: ").append(pageW).append("×").append(pageH).append("mm")
+            .append(" &nbsp;|&nbsp; 边距: ").append(padT).append("/").append(padR)
+            .append("/").append(padB).append("/").append(padL).append("mm")
+            .append(" (上/右/下/左)<br>\n");
         html.append("  总行数: ").append(lines.size()).append(" &nbsp;|&nbsp; ")
             .append("页数: ").append(pageNum).append("<br>\n");
         html.append("  生成时间: ").append(java.time.LocalDateTime.now()).append("</p>\n");

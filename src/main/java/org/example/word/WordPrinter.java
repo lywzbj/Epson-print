@@ -136,6 +136,12 @@ public class WordPrinter {
         log("文档: " + doc.getFilePath());
         log("规则: " + (selector != null ? selector.toString() : "全部"));
 
+        // 传递文档页面布局到预览
+        if (doc.getPageLayout() != null) {
+            preview.setPageLayout(doc.getPageLayout());
+        }
+        preview.setHeaderFooter(doc.getHeaderText(), doc.getFooterText());
+
         List<WordDocument.WordParagraph> paragraphs = doc.getAllParagraphs();
         int totalLines = paragraphs.size();
         int recordedLines = 0;
