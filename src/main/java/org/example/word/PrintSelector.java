@@ -349,6 +349,12 @@ public class PrintSelector {
     }
 
     public Set<Integer> selectedPages() { return Collections.unmodifiableSet(selectedPages); }
+    /** 清除页面过滤，使 pageOf 不再过滤任何行 */
+    public PrintSelector clearPageFilter() { selectedPages.clear(); return this; }
+    /** 批量添加白名单行号 */
+    public PrintSelector addSelectLines(Collection<Integer> lineNumbers) {
+        selectLineNumbers.addAll(lineNumbers); return this;
+    }
     public int lineStart() { return lineStart; }
     public int lineEnd() { return lineEnd; }
     public int linesPerPage() { return linesPerPage; }

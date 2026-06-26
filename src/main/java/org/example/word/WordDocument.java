@@ -10,7 +10,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
@@ -26,48 +31,47 @@ import java.util.regex.Pattern;
  */
 public class WordDocument {
 
-    /** 针式打印机默认每页行数 */
-    public static final int DEFAULT_LINES_PER_PAGE = 66;
-
     private final String filePath;
-    private final List<WordParagraph> paragraphs;
-    private int linesPerPage;
+    /** 所有页的列表 */
+    private final List<WordPageInstance> pages;
+    /** 文档级页面布局（从最后一个 sectPr 提取，用作默认） */
     private DocPageLayout pageLayout;
+    /** 文档级页眉文本 */
     private String headerText;
+    /** 文档级页脚文本 */
     private String footerText;
 
-    private WordDocument(String filePath, int linesPerPage) {
+    // 编号/列表支持 — 从 word/numbering.xml 解析
+    private Map<Integer, Integer> numToAbstract;               // numId → abstractNumId
+    private Map<Integer, Map<Integer, LevelDef>> abstractNumLevels; // abstractNumId → (ilvl → LevelDef)
+    private Map<String, Integer> numCounters;                  // "numId:ilvl" → 当前计数
+
+    private WordDocument(String filePath) {
         this.filePath = filePath;
-        this.linesPerPage = linesPerPage;
-        this.paragraphs = new ArrayList<>();
+        this.pages = new ArrayList<>();
     }
 
     // ======== 工厂方法 ========
 
-    /**
-     * 加载 .docx 文件。
-     * @param filePath 文件路径
-     */
+    /** 加载 .docx 文件，返回包含所有页的 WordDocument。 */
     public static WordDocument load(String filePath) throws IOException {
-        return load(filePath, DEFAULT_LINES_PER_PAGE);
-    }
-
-    /**
-     * 加载 .docx 文件并指定每页行数。
-     * @param filePath      文件路径
-     * @param linesPerPage  每页行数（用于页码估算）
-     */
-    public static WordDocument load(String filePath, int linesPerPage) throws IOException {
-        WordDocument doc = new WordDocument(filePath, linesPerPage);
+        WordDocument doc = new WordDocument(filePath);
         doc.parse();
         return doc;
     }
 
     /**
-     * 从 InputStream 加载（兼容 classpath 资源）。
+     * 加载 .docx 文件的指定页。
+     * 内部完整解析文档后只保留目标页的 {@link WordPageInstance}。
      */
-    public static WordDocument load(InputStream in, int linesPerPage) throws IOException {
-        WordDocument doc = new WordDocument("(stream)", linesPerPage);
+    public static WordDocument loadPage(String filePath, int page) throws IOException {
+        WordDocument doc = WordDocument.load(filePath);
+        return doc.extractPage(page);
+    }
+
+    /** 从 InputStream 加载。 */
+    public static WordDocument load(InputStream in) throws IOException {
+        WordDocument doc = new WordDocument("(stream)");
         doc.parse(in);
         return doc;
     }
@@ -81,29 +85,43 @@ public class WordDocument {
     }
 
     private void parse(InputStream in) throws IOException {
-        paragraphs.clear();
+        pages.clear();
         pageLayout = null;
         headerText = null;
         footerText = null;
+        numToAbstract = new HashMap<>();
+        abstractNumLevels = new HashMap<>();
+        numCounters = new HashMap<>();
         XWPFDocument doc = new XWPFDocument(in);
 
-        // 提取文档级页面布局和页眉/页脚
+        // 提取文档级页面布局、页眉/页脚、编号定义
         extractPageLayout(doc);
         extractHeadersFooters(doc);
+        parseNumberingDefinitions(doc);
 
-        int tableCount = 0;  // 当前表格序号 (0-based)
+        // 第一阶段：平铺所有段落并记录分页点
+        List<WordParagraph> allParagraphs = new ArrayList<>();
+        Set<Integer> pageBreakAt = new HashSet<>();  // 新页起始段落索引 (0-based)
+        int tableCount = 0;
 
-        // 遍历所有 IBODY 元素（包括正文、页眉页脚、表格等）
         for (IBodyElement element : doc.getBodyElements()) {
             if (element instanceof XWPFParagraph) {
                 XWPFParagraph para = (XWPFParagraph) element;
                 WordParagraph wp = parseParagraph(para);
                 if (wp != null) {
-                    paragraphs.add(wp);
+                    // lastRenderedPageBreak 标记"本段落开始于新页"
+                    if (hasPageBreakBefore(para)) {
+                        pageBreakAt.add(allParagraphs.size());
+                    }
+                    allParagraphs.add(wp);
+                    // 硬分页符/分节符标记"下一段落开始于新页"
+                    if (hasPageBreakAfter(para)) {
+                        pageBreakAt.add(allParagraphs.size());
+                    }
                 }
             } else if (element instanceof XWPFTable) {
                 XWPFTable table = (XWPFTable) element;
-                int rowNum = 0;  // 当前表格内行号 (1-based)
+                int rowNum = 0;
                 for (XWPFTableRow row : table.getRows()) {
                     rowNum++;
                     StringBuilder rowText = new StringBuilder();
@@ -117,7 +135,7 @@ public class WordDocument {
                         }
                     }
                     if (rowText.length() > 0) {
-                        paragraphs.add(new WordParagraph(rowText.toString(),
+                        allParagraphs.add(new WordParagraph(rowText.toString(),
                                 false, false, false, 0, null,
                                 true, tableCount, rowNum));
                     }
@@ -127,6 +145,9 @@ public class WordDocument {
         }
 
         doc.close();
+
+        // 第二阶段：基于分页点将段落切片为 WordPageInstance
+        buildPageInstances(allParagraphs, pageBreakAt);
     }
 
     /**
@@ -173,6 +194,13 @@ public class WordDocument {
         }
 
         String text = fullText.toString();
+
+        // 自动编号/列表: 从 word/numbering.xml 解析并前置于段落文本
+        String numText = getNumberingText(para);
+        if (numText != null) {
+            text = numText + text;
+        }
+
         if (text.isEmpty()) {
             return new WordParagraph("");
         }
@@ -445,10 +473,382 @@ public class WordDocument {
     }
 
     // ================================================================
-    // 页面信息 getter
+    // 编号/列表定义解析
     // ================================================================
 
-    /** 文档页面布局信息（纸张尺寸、页边距等），可能为 null */
+    /**
+     * 解析 word/numbering.xml，提取列表编号定义。
+     *
+     * <p>编号信息存储在两部分：
+     * <ul>
+     *   <li>{@code <w:abstractNum>} — 编号格式定义 (numFmt, lvlText, start)</li>
+     *   <li>{@code <w:num>} — numId → abstractNumId 映射</li>
+     * </ul>
+     * 段落通过 {@code <w:numPr>} 引用 numId + ilvl 来应用编号。
+     */
+    private void parseNumberingDefinitions(XWPFDocument doc) {
+        try {
+            String xml = readPartXml(doc, "/word/numbering.xml");
+            if (xml == null || xml.isEmpty()) return;
+
+            // 1. 解析 num → abstractNum 映射
+            //    <w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>
+            Pattern numPattern = Pattern.compile(
+                    "<w:num\\s[^>]*w:numId=\"(\\d+)\"[^>]*>.*?<w:abstractNumId\\s[^>]*w:val=\"(\\d+)\"[^>]*/>",
+                    Pattern.DOTALL);
+            java.util.regex.Matcher nm = numPattern.matcher(xml);
+            while (nm.find()) {
+                numToAbstract.put(Integer.parseInt(nm.group(1)), Integer.parseInt(nm.group(2)));
+            }
+
+            // 2. 解析 abstractNum 定义
+            //    <w:abstractNum w:abstractNumId="0"> ... <w:lvl w:ilvl="0"> ... </w:lvl> ... </w:abstractNum>
+            Pattern absPattern = Pattern.compile(
+                    "<w:abstractNum\\s[^>]*w:abstractNumId=\"(\\d+)\"[^>]*>(.*?)</w:abstractNum>",
+                    Pattern.DOTALL);
+            java.util.regex.Matcher am = absPattern.matcher(xml);
+            while (am.find()) {
+                int absNumId = Integer.parseInt(am.group(1));
+                String absContent = am.group(2);
+
+                Map<Integer, LevelDef> levels = new HashMap<>();
+                Pattern lvlPattern = Pattern.compile(
+                        "<w:lvl\\s[^>]*w:ilvl=\"(\\d+)\"[^>]*>(.*?)</w:lvl>",
+                        Pattern.DOTALL);
+                java.util.regex.Matcher lm = lvlPattern.matcher(absContent);
+                while (lm.find()) {
+                    int ilvl = Integer.parseInt(lm.group(1));
+                    String lvlContent = lm.group(2);
+
+                    // numFmt: "decimal", "bullet", "upperLetter", ...
+                    String numFmt = "decimal";
+                    java.util.regex.Matcher fmtM = Pattern.compile(
+                            "<w:numFmt\\s[^>]*w:val=\"([^\"]+)\"").matcher(lvlContent);
+                    if (fmtM.find()) numFmt = fmtM.group(1);
+
+                    // lvlText: "%1.", "%1.%2.", "•", "第%1条", ...
+                    String lvlText = "%1.";
+                    java.util.regex.Matcher txtM = Pattern.compile(
+                            "<w:lvlText\\s[^>]*w:val=\"([^\"]*)\"").matcher(lvlContent);
+                    if (txtM.find()) lvlText = txtM.group(1);
+
+                    // start: 起始编号 (默认 1)
+                    int start = 1;
+                    java.util.regex.Matcher stM = Pattern.compile(
+                            "<w:start\\s[^>]*w:val=\"(\\d+)\"").matcher(lvlContent);
+                    if (stM.find()) start = Integer.parseInt(stM.group(1));
+
+                    levels.put(ilvl, new LevelDef(numFmt, lvlText, start));
+                }
+                if (!levels.isEmpty()) {
+                    abstractNumLevels.put(absNumId, levels);
+                }
+            }
+        } catch (Exception ignored) {
+            // 编号解析失败不影响正文提取
+        }
+    }
+
+    /**
+     * 从段落的 numPr 中提取编号文本（如 "1.", "•", "一、" 等）。
+     * 自动跟踪各编号序列的计数器。
+     *
+     * @param para XWPFParagraph
+     * @return 编号文本，无编号时返回 null
+     */
+    private String getNumberingText(XWPFParagraph para) {
+        try {
+            if (para.getCTP().getPPr() == null) return null;
+            if (para.getCTP().getPPr().getNumPr() == null) return null;
+
+            var numPr = para.getCTP().getPPr().getNumPr();
+            if (numPr.getNumId() == null || numPr.getNumId().getVal() == null) return null;
+
+            int numId = numPr.getNumId().getVal().intValue();
+            int ilvl = (numPr.getIlvl() != null && numPr.getIlvl().getVal() != null)
+                    ? numPr.getIlvl().getVal().intValue() : 0;
+
+            // 检查是否有段落级编号重设
+            Integer startOverride = null;
+            try {
+                String numPrXml = numPr.toString();
+                java.util.regex.Matcher ovM = Pattern.compile(
+                        "<w:numStartOverride\\s[^>]*w:val=\"(\\d+)\"").matcher(numPrXml);
+                if (ovM.find()) startOverride = Integer.parseInt(ovM.group(1));
+            } catch (Exception ignored) {}
+
+            // 查找抽象编号定义
+            Integer abstractNumId = numToAbstract.get(numId);
+            if (abstractNumId == null) return null;
+
+            Map<Integer, LevelDef> levels = abstractNumLevels.get(abstractNumId);
+            if (levels == null) return null;
+
+            LevelDef level = levels.get(ilvl);
+            if (level == null) return null;
+
+            // 无序号类型 (bullet) — 直接返回 lvlText 原样
+            if ("bullet".equals(level.numFmt) || "none".equals(level.numFmt)) {
+                return level.lvlText + " ";
+            }
+
+            // 获取/初始化计数器
+            String counterKey = numId + ":" + ilvl;
+            Integer counter = numCounters.get(counterKey);
+            if (counter == null || startOverride != null) {
+                counter = (startOverride != null) ? startOverride : level.start;
+            }
+
+            // 将计数值格式化为显示文本
+            String formatted = formatNumber(counter, level.numFmt);
+            numCounters.put(counterKey, counter + 1);  // 递增
+
+            // 替换 lvlText 中的占位符 (%1, %2, ...)
+            String result = level.lvlText;
+            result = result.replace("%" + (ilvl + 1), formatted);
+            // 未跟踪的层级 → "1"
+            result = result.replaceAll("%\\d+", "1");
+
+            return result;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 将计数值按 numFmt 格式化为显示字符串。
+     */
+    private static String formatNumber(int num, String numFmt) {
+        if (numFmt == null) return String.valueOf(num);
+        switch (numFmt) {
+            case "decimal":
+                return String.valueOf(num);
+            case "upperLetter":
+                return toUpperLetter(num);
+            case "lowerLetter":
+                return toLowerLetter(num);
+            case "upperRoman":
+                return toRoman(num, true);
+            case "lowerRoman":
+                return toRoman(num, false);
+            case "japaneseCounting":
+            case "chineseCounting":
+                return toChineseCounting(num);
+            case "chineseLegalSimplified":
+                return toChineseCounting(num);  // 简体中文法律编号
+            default:
+                return String.valueOf(num);
+        }
+    }
+
+    /** 1→A, 2→B, ..., 26→Z, 27→AA, ... */
+    private static String toUpperLetter(int n) {
+        StringBuilder sb = new StringBuilder();
+        while (n > 0) {
+            n--;
+            sb.insert(0, (char) ('A' + (n % 26)));
+            n /= 26;
+        }
+        return sb.toString();
+    }
+
+    private static String toLowerLetter(int n) {
+        return toUpperLetter(n).toLowerCase();
+    }
+
+    /** 整数 → 罗马数字 */
+    private static String toRoman(int n, boolean upper) {
+        if (n <= 0) return String.valueOf(n);
+        int[] vals = {1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1};
+        String[] symsU = {"M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"};
+        String[] symsL = {"m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"};
+        String[] syms = upper ? symsU : symsL;
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        while (n > 0) {
+            while (n >= vals[i]) {
+                sb.append(syms[i]);
+                n -= vals[i];
+            }
+            i++;
+        }
+        return sb.toString();
+    }
+
+    /** 阿拉伯数字 → 中文小写数字 (1→一, 10→十, 11→十一, 100→一百) */
+    private static String toChineseCounting(int n) {
+        if (n <= 0) return String.valueOf(n);
+        if (n <= 10) {
+            String[] simple = {"", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"};
+            return simple[n];
+        }
+        if (n < 20) {
+            return "十" + toChineseCounting(n - 10);
+        }
+        if (n < 100) {
+            int tens = n / 10;
+            int ones = n % 10;
+            return toChineseCounting(tens) + "十" + (ones > 0 ? toChineseCounting(ones) : "");
+        }
+        if (n < 1000) {
+            int hundreds = n / 100;
+            int rest = n % 100;
+            String result = toChineseCounting(hundreds) + "百";
+            if (rest > 0) {
+                if (rest < 10) result += "零";
+                result += toChineseCounting(rest);
+            }
+            return result;
+        }
+        return String.valueOf(n);
+    }
+
+    // ================================================================
+    // 页面分页检测
+    // ================================================================
+
+    /**
+     * 段落是否"开始于新页" — 由 Word 渲染提示 {@code <w:lastRenderedPageBreak/>} 标记。
+     * Word 将此元素放在新页第一个段落的第一个 run 中。
+     */
+    private boolean hasPageBreakBefore(XWPFParagraph para) {
+        try {
+            for (XWPFRun run : para.getRuns()) {
+                if (!run.getCTR().getLastRenderedPageBreakList().isEmpty()) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {}
+        return false;
+    }
+
+    /**
+     * 段落是否"结束后换页" — 硬分页符 (Ctrl+Enter) 或非连续分节符。
+     */
+    private boolean hasPageBreakAfter(XWPFParagraph para) {
+        // 1. 硬分页符 <w:br w:type="page"/>
+        try {
+            for (XWPFRun run : para.getRuns()) {
+                for (var br : run.getCTR().getBrList()) {
+                    if (br.getType() != null
+                            && br.getType() == org.openxmlformats.schemas.wordprocessingml.x2006.main.STBrType.PAGE) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+
+        // 2. 段落级分节符（非 continuous 强制换页）
+        try {
+            if (para.getCTP().getPPr() != null
+                    && para.getCTP().getPPr().getSectPr() != null) {
+                var sectPr = para.getCTP().getPPr().getSectPr();
+                if (sectPr.getType() == null) {
+                    return true;  // 默认 = nextPage
+                }
+                var val = sectPr.getType().getVal();
+                if (val != org.openxmlformats.schemas.wordprocessingml.x2006.main.STSectionMark.CONTINUOUS
+                        && val != org.openxmlformats.schemas.wordprocessingml.x2006.main.STSectionMark.NEXT_COLUMN) {
+                    return true;
+                }
+            }
+        } catch (Exception ignored) {}
+
+        return false;
+    }
+
+    /**
+     * 将平铺的段落列表按分页点切片，构建 {@link WordPageInstance} 列表。
+     *
+     * <p>对没有显式分页符的大段连续内容，用逐段行数估算插入软分页。
+     */
+    private void buildPageInstances(List<WordParagraph> allParagraphs, Set<Integer> pageBreakAt) {
+        pages.clear();
+        if (allParagraphs.isEmpty()) return;
+
+        // 计算所有分页点（含软分页）
+        List<Integer> sortedBreaks = new ArrayList<>(pageBreakAt);
+        sortedBreaks.remove(Integer.valueOf(0));
+        sortedBreaks.sort(Integer::compareTo);
+
+        List<Integer> allBreaks = new ArrayList<>();
+        int breakIdx = 0;
+        int currentStart = 0;
+
+        while (currentStart < allParagraphs.size()) {
+            allBreaks.add(currentStart);
+
+            int nextExplicit = allParagraphs.size();
+            while (breakIdx < sortedBreaks.size() && sortedBreaks.get(breakIdx) <= currentStart) {
+                breakIdx++;
+            }
+            if (breakIdx < sortedBreaks.size()) {
+                nextExplicit = sortedBreaks.get(breakIdx);
+            }
+
+            int accLines = 0;
+            int maxLines = (pageLayout != null) ? pageLayout.printableLines(6) : 66;
+            if (maxLines < 10) maxLines = 66;
+
+            for (int i = currentStart; i < nextExplicit && i < allParagraphs.size(); i++) {
+                int est = estimateLines(allParagraphs.get(i));
+                if (accLines > 0 && accLines + est > maxLines) {
+                    allBreaks.add(i);
+                    accLines = est;
+                } else {
+                    accLines += est;
+                }
+            }
+
+            currentStart = nextExplicit;
+        }
+
+        // 去重排序
+        allBreaks = new ArrayList<>(new HashSet<>(allBreaks));
+        allBreaks.sort(Integer::compareTo);
+
+        // 切片构建 WordPageInstance
+        for (int i = 0; i < allBreaks.size(); i++) {
+            int startIdx = allBreaks.get(i);
+            int endIdx = (i + 1 < allBreaks.size()) ? allBreaks.get(i + 1) : allParagraphs.size();
+            List<WordDocument.WordParagraph> pageParas = allParagraphs.subList(startIdx, endIdx);
+            pages.add(new WordPageInstance(i + 1, new ArrayList<>(pageParas),
+                    pageLayout, headerText, footerText));
+        }
+    }
+
+    private int estimateLines(WordParagraph wp) {
+        String text = wp.getText();
+        if (text == null || text.isEmpty()) return 1;
+        try {
+            int byteLen = text.getBytes("GBK").length;
+            int colsPerLine = (pageLayout != null)
+                    ? Math.max(1, pageLayout.printableCols(10) - 2) : 69;
+            return Math.max(1, (int) Math.ceil((double) byteLen / colsPerLine));
+        } catch (Exception e) {
+            return 1;
+        }
+    }
+
+    /** 提取单页：创建仅含目标页的新 WordDocument。 */
+    private WordDocument extractPage(int page) {
+        if (page < 1 || page > pages.size()) {
+            return this; // 无效页码，返回空或原文档
+        }
+        WordPageInstance pi = pages.get(page - 1);
+        WordDocument result = new WordDocument(this.filePath);
+        result.pages.add(pi);
+        result.pageLayout = pi.getPageLayout();
+        result.headerText = pi.getHeaderText();
+        result.footerText = pi.getFooterText();
+        return result;
+    }
+
+    // ================================================================
+    // 页面/文档信息 getter
+    // ================================================================
+
+    /** 文档页面布局信息（取自最后一节的 sectPr），可能为 null */
     public DocPageLayout getPageLayout() { return pageLayout; }
 
     /** 页眉纯文本，无页眉时为 null */
@@ -509,9 +909,12 @@ public class WordDocument {
         int fromStyle = resolveParagraphSpacingFromStyle(para, which);
         if (fromStyle >= 0) return fromStyle;
 
-        // 3. 从 docDefaults 解析
-        int fromDefaults = resolveSpacingFromDocDefaults(para, which);
-        if (fromDefaults >= 0) return fromDefaults;
+        // 3. 从 docDefaults 解析（仅 line 回退到 docDefaults；
+        //    before/after 的 docDefaults 值是"正常段间距"，针打场景应忽略）
+        if ("line".equals(which)) {
+            int fromDefaults = resolveSpacingFromDocDefaults(para, which);
+            if (fromDefaults >= 0) return fromDefaults;
+        }
 
         // 4. 回退
         return 0;
@@ -694,32 +1097,73 @@ public class WordDocument {
 
     // ======== 查询方法 ========
 
-    /** 所有段落列表 */
+    /** 获取所有页 */
+    public List<WordPageInstance> getPages() {
+        return new ArrayList<>(pages);
+    }
+
+    /** 获取指定页 */
+    public WordPageInstance getPage(int page) {
+        if (page < 1 || page > pages.size()) return null;
+        return pages.get(page - 1);
+    }
+
+    /** 所有页的所有段落（扁平合并） */
     public List<WordParagraph> getAllParagraphs() {
-        return new ArrayList<>(paragraphs);
+        List<WordParagraph> result = new ArrayList<>();
+        for (WordPageInstance page : pages) {
+            result.addAll(page.getParagraphs());
+        }
+        return result;
     }
 
-    /** 总段落数 */
+    /** 跨所有页的段落总数 */
     public int getParagraphCount() {
-        return paragraphs.size();
+        int count = 0;
+        for (WordPageInstance page : pages) count += page.getParagraphCount();
+        return count;
     }
 
-    /** 估计总页数 */
+    /** 页数 */
     public int getTotalPages() {
-        return (int) Math.ceil((double) paragraphs.size() / linesPerPage);
+        return pages.size();
     }
 
-    /** 估计总行数 (≈ 段落数) */
+    /** 总段落数（向后兼容） */
     public int getTotalLines() {
-        return paragraphs.size();
+        return getParagraphCount();
+    }
+
+    /**
+     * 获取第 page 页的起始全局行号 (1-based)。
+     * @deprecated 推荐使用 {@link #getPage(int)}.getParagraphs() 直接获取页面内容
+     */
+    @Deprecated
+    public int getPageStartLine(int page) {
+        int count = 0;
+        for (int i = 0; i < page - 1 && i < pages.size(); i++) {
+            count += pages.get(i).getParagraphCount();
+        }
+        return page <= pages.size() ? count + 1 : 0;
+    }
+
+    /**
+     * 获取第 page 页的结束全局行号 (1-based, 含)。
+     * @deprecated 推荐直接使用 {@link WordPageInstance}
+     */
+    @Deprecated
+    public int getPageEndLine(int page) {
+        int count = 0;
+        for (int i = 0; i < page && i < pages.size(); i++) {
+            count += pages.get(i).getParagraphCount();
+        }
+        return page <= pages.size() ? count : 0;
     }
 
     /** 获取指定页的段落 */
     public List<WordParagraph> getParagraphs(int page) {
-        int start = (page - 1) * linesPerPage;
-        int end = Math.min(start + linesPerPage, paragraphs.size());
-        if (start >= paragraphs.size()) return new ArrayList<>();
-        return new ArrayList<>(paragraphs.subList(start, end));
+        WordPageInstance pi = getPage(page);
+        return pi != null ? pi.getParagraphs() : new ArrayList<>();
     }
 
     /** 获取页码范围段落 */
@@ -731,12 +1175,13 @@ public class WordDocument {
         return result;
     }
 
-    /** 获取行范围段落 */
+    /** 获取行范围段落（跨所有页查找） */
     public List<WordParagraph> getParagraphsByLines(int lineStart, int lineEnd) {
+        List<WordParagraph> all = getAllParagraphs();
         int start = Math.max(0, lineStart - 1);
-        int end = Math.min(lineEnd, paragraphs.size());
-        if (start >= paragraphs.size()) return new ArrayList<>();
-        return new ArrayList<>(paragraphs.subList(start, end));
+        int end = Math.min(lineEnd, all.size());
+        if (start >= all.size()) return new ArrayList<>();
+        return new ArrayList<>(all.subList(start, end));
     }
 
     /** 文件路径 */
@@ -744,56 +1189,42 @@ public class WordDocument {
         return filePath;
     }
 
-    /** 每页行数 */
+    /**
+     * 基于页面布局计算的实际每页可打印行数。
+     */
     public int getLinesPerPage() {
-        return linesPerPage;
+        if (pageLayout != null) return pageLayout.printableLines(6);
+        return getParagraphCount() / Math.max(1, pages.size());
     }
 
-    public void setLinesPerPage(int linesPerPage) {
-        this.linesPerPage = linesPerPage;
-    }
+    /** @deprecated 由 DocPageLayout 自动计算 */
+    @Deprecated
+    public void setLinesPerPage(int linesPerPage) { }
 
     // ======== 表格查询 ========
 
-    /**
-     * 统计文档中的表格数量。
-     * @return 表格总数
-     */
+    /** 跨所有页统计表格数量 */
     public int getTableCount() {
         int max = -1;
-        for (WordParagraph wp : paragraphs) {
-            if (wp.isTableRow && wp.tableIndex > max) {
-                max = wp.tableIndex;
-            }
+        for (WordParagraph wp : getAllParagraphs()) {
+            if (wp.isTableRow && wp.tableIndex > max) max = wp.tableIndex;
         }
         return max + 1;
     }
 
-    /**
-     * 获取指定表格的全部行（按行号排序）。
-     * @param tableIndex 表格序号 (0-based)
-     * @return 该表格所有行的段落列表
-     */
+    /** 获取指定表格的全部行（跨所有页） */
     public List<WordParagraph> getTableParagraphs(int tableIndex) {
         List<WordParagraph> result = new ArrayList<>();
-        for (WordParagraph wp : paragraphs) {
-            if (wp.isTableRow && wp.tableIndex == tableIndex) {
-                result.add(wp);
-            }
+        for (WordParagraph wp : getAllParagraphs()) {
+            if (wp.isTableRow && wp.tableIndex == tableIndex) result.add(wp);
         }
-        // 按行号排序
         result.sort((a, b) -> Integer.compare(a.rowInTable, b.rowInTable));
         return result;
     }
 
-    /**
-     * 获取指定表格的指定行。
-     * @param tableIndex 表格序号 (0-based)
-     * @param rowInTable 行号 (1-based)
-     * @return 该行段落，找不到返回 null
-     */
+    /** 获取指定表格的指定行（跨所有页） */
     public WordParagraph getTableRow(int tableIndex, int rowInTable) {
-        for (WordParagraph wp : paragraphs) {
+        for (WordParagraph wp : getAllParagraphs()) {
             if (wp.isTableRow && wp.tableIndex == tableIndex && wp.rowInTable == rowInTable) {
                 return wp;
             }
@@ -801,17 +1232,28 @@ public class WordDocument {
         return null;
     }
 
-    /**
-     * 获取文档中所有表格行段落（扁平列表）。
-     */
+    /** 获取文档中所有表格行段落（跨所有页） */
     public List<WordParagraph> getAllTableRows() {
         List<WordParagraph> result = new ArrayList<>();
-        for (WordParagraph wp : paragraphs) {
-            if (wp.isTableRow) {
-                result.add(wp);
-            }
+        for (WordParagraph wp : getAllParagraphs()) {
+            if (wp.isTableRow) result.add(wp);
         }
         return result;
+    }
+
+    // ============ 内部类：编号级别定义 ============
+
+    /** 编号列表的一个级别定义（从 numbering.xml 的 abstractNum/lvl 解析） */
+    private static class LevelDef {
+        final String numFmt;   // "decimal", "upperLetter", "bullet", "chineseCounting", ...
+        final String lvlText;  // "%1.", "%1.%2.", "•", etc.
+        final int start;       // 起始编号
+
+        LevelDef(String numFmt, String lvlText, int start) {
+            this.numFmt = (numFmt != null) ? numFmt : "decimal";
+            this.lvlText = (lvlText != null) ? lvlText : "%1.";
+            this.start = start;
+        }
     }
 
     // ============ 内部类：WordParagraph ============

@@ -7,7 +7,9 @@ import org.example.service.PrinterService;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Word 文档打印桥接器。
@@ -52,28 +54,67 @@ public class WordPrinter {
      * 打印整个 Word 文档（无过滤）。
      */
     public void print(WordDocument doc) throws IOException {
-        print(doc, null);
+        print(doc, null, null);
     }
 
     /**
-     * 按选择器规则打印 Word 文档。
+     * 按选择器规则打印 Word 文档（无配置，使用打印机默认状态）。
      * @param doc      已加载的 Word 文档
      * @param selector 选择规则（为 null 时打印全部）
      */
     public void print(WordDocument doc, PrintSelector selector) throws IOException {
+        print(doc, selector, null);
+    }
+
+    /**
+     * 按选择器规则 + 打印配置打印 Word 文档。
+     *
+     * <p>当 config 不为 null 时，先调用 {@link PrinterService#applyConfig(PrintConfig)}
+     * 设置页边距/页长/CPI 等，确保页面级设置在整个打印过程中保持生效。
+     * config 为 null 时回退到旧行为：发送 ESC @ 初始化 + 1/6" 行距。
+     *
+     * @param doc      已加载的 Word 文档
+     * @param selector 选择规则（为 null 时打印全部）
+     * @param config   打印配置（为 null 时使用打印机默认状态）
+     */
+    public void print(WordDocument doc, PrintSelector selector, PrintConfig config) throws IOException {
         long startTime = System.currentTimeMillis();
 
         if (selector != null) {
             selector.linesPerPage(doc.getLinesPerPage());
+            // 将页面过滤展开为行号过滤（基于文档真实分页符）
+            resolvePageRanges(selector, doc);
             log("文档: " + doc.getFilePath());
             log("规则: " + selector);
         } else {
             log("文档: " + doc.getFilePath() + " (打印全部)");
         }
 
-        // 初始化打印机
-        printer.init();
-        printer.setLineSpacing1_6();
+        // 初始化打印机状态
+        if (config != null) {
+            // 使用配置初始化：避免 autoInit 导致的重复 ESC @
+            PrintConfig configNoInit = PrintConfig.builder()
+                    .physicalPaper(config.getPhysicalPaper())
+                    .pageLayout(config.getPageLayout())
+                    .topMargin(config.getTopMargin())
+                    .bottomMargin(config.getBottomMargin())
+                    .leftMargin(config.getLeftMargin())
+                    .rightMargin(config.getRightMargin())
+                    .cpi(config.getCpi())
+                    .lineSpacing(config.getLineSpacing())
+                    .lineSpacingValue(config.getLineSpacingValue())
+                    .autoInit(true)  // 让 applyConfig 内部发 ESC @
+                    .build();
+            printer.applyConfig(configNoInit);
+            this.baseLeftMargin = config.getLeftMargin();
+            this.currentLeftIndentCols = this.baseLeftMargin;
+            log("配置: " + config);
+        } else {
+            printer.init();
+            printer.setLineSpacing1_6();
+            this.baseLeftMargin = 0;
+            this.currentLeftIndentCols = 0;
+        }
         resetFormatState();
 
         // 遍历段落
@@ -226,32 +267,69 @@ public class WordPrinter {
         applyParagraphIndent(wp);
         String alignedText = applyParagraphAlignment(wp, text);
 
-        // 3. 字体样式
-        applyFormat(wp);
-
-        // 4. 打印内容
+        // 3. 打印内容 — 中文/英文分支
         if (wp.shouldUseChineseMode()) {
-            printer.enterChineseMode();
-            if (wp.getFontName() != null) {
-                applyChineseFont(wp.getFontName());
-            }
-            int fontSizePt = wp.getFontSizePt();
-            if (fontSizePt > 0 && fontSizePt != currentChineseFontSize) {
-                applyChineseFontSize(fontSizePt);
-                currentChineseFontSize = fontSizePt;
-            }
-            printer.sendRaw(EscpCommand.encodeChinese(alignedText));
-            printer.send(EscpCommand.carriageReturn());
-            printer.send(EscpCommand.lineFeed());
-            printer.exitChineseMode();
+            printChineseParagraph(wp, alignedText);
         } else {
+            // 字体样式（CPI/DW/DH 仅在 ASCII 模式下使用）
+            applyFormat(wp);
             printer.printText(alignedText);
+            resetFormat(wp);
         }
 
-        // 5. 恢复格式 + 段后间距
-        resetFormat(wp);
+        // 4. 恢复缩进 + 段后间距
         restoreParagraphIndent(wp);
         applyParagraphSpacingAfter(wp);
+    }
+
+    /** 打印汉字段落 — FS S + 倍宽倍高组合控制尺寸 */
+    private void printChineseParagraph(WordDocument.WordParagraph wp, String text) throws IOException {
+        printer.enterChineseMode();
+
+        // 加粗/斜体
+        if (wp.isBold() != currentBold) {
+            printer.bold(wp.isBold());
+            currentBold = wp.isBold();
+        }
+        if (wp.isItalic() != currentItalic) {
+            printer.italic(wp.isItalic());
+            currentItalic = wp.isItalic();
+        }
+
+        // 汉字字体
+        if (wp.getFontName() != null) {
+            applyChineseFont(wp.getFontName());
+        }
+
+        // 汉字字号：FS S + ESC W/ESC w 组合映射
+        int fontSizePt = wp.getFontSizePt();
+        if (fontSizePt > 0 && fontSizePt != currentChineseFontSize) {
+            applyChineseFontSize(fontSizePt);
+            currentChineseFontSize = fontSizePt;
+        }
+
+        // 打印汉字
+        printer.sendRaw(EscpCommand.encodeChinese(text));
+        printer.send(EscpCommand.carriageReturn());
+        printer.send(EscpCommand.lineFeed());
+
+        // 恢复
+        if (wp.isBold()) {
+            printer.bold(false);
+            currentBold = false;
+        }
+        if (wp.isItalic()) {
+            printer.italic(false);
+            currentItalic = false;
+        }
+        // 恢复倍宽倍高
+        if (currentChineseDW) {
+            printer.doubleWidth(false);
+            printer.doubleHeight(false);
+            currentChineseDW = false;
+        }
+
+        printer.exitChineseMode();
     }
 
     // ======== 格式映射 ========
@@ -332,8 +410,8 @@ public class WordPrinter {
 
         int bestCPI  = WIDTH_OPTIONS[bestIdx][0];
         int bestDW   = WIDTH_OPTIONS[bestIdx][1];
-        // 高度维度：大字号自动倍高
-        int bestDH   = (fontSizePt >= 18) ? 1 : 0;
+        // DW/DH 始终配对，保证字符比例方正不压扁
+        int bestDH   = (bestDW == 1) ? 1 : 0;
 
         // 应用
         switch (bestCPI) {
@@ -341,42 +419,56 @@ public class WordPrinter {
             case 12: printer.select12CPI(); break;
             case 15: printer.select15CPI(); break;
         }
+        currentCPI = bestCPI;  // 追踪以便 resetFormat 恢复
         printer.doubleWidth(bestDW == 1);
         printer.doubleHeight(bestDH == 1);
     }
 
     /**
-     * 将 Word 字号映射为汉字字符大小 (FS S w h)。
+     * 将 Word 字号映射为 FS S + 倍宽倍高组合。
      *
-     * <p>FS S 基准：1×1 ≈ 10.5pt (宋体五号)
+     * <p>DLQ-3500K 上 ESC W/ESC w 在汉字模式内对汉字生效。
+     * FS S 1×1 基准 ≈ 9.6pt，开启倍宽倍高后等效 ≈ 19.2pt。
      * <pre>
-     *   w/h = round(pt / 10.5)，范围 clamp 到 1~4
-     *   如 12pt → 1×1, 16pt → 2×2, 22pt → 2×2, 26pt → 2×3, 36pt → 3×3, 42pt → 4×4
+     *   ≤10pt  → FS S 1×1
+     *   11-18  → FS S 1×1 + DW + DH (~19pt)
+     *   19-28  → FS S 2×2 + DW + DH (~38pt)
+     *   29+    → FS S 3×3 + DW + DH (~58pt)
      * </pre>
      */
     private void applyChineseFontSize(int fontSizePt) throws IOException {
         if (fontSizePt <= 0) return;
 
-        double baseline = 10.5;
-        int w = (int) Math.round(fontSizePt / baseline);
-        int h = (int) Math.round(fontSizePt / baseline);
+        int ss;          // FS S 倍数 (1-4)
+        boolean useDW;   // 是否配合倍宽倍高
 
-        // 标题级别：高度比宽度多一档更接近 Word 排版比例
-        if (fontSizePt >= 22 && h <= w && h < 4) {
-            h = Math.min(4, w + 1);
+        if (fontSizePt <= 10) {
+            ss = 1;   useDW = false;     // ~9.6pt
+        } else if (fontSizePt <= 18) {
+            ss = 1;   useDW = true;      // ~19pt
+        } else if (fontSizePt <= 28) {
+            ss = 2;   useDW = true;      // ~38pt
+        } else {
+            ss = 3;   useDW = true;      // ~58pt
         }
 
-        w = Math.max(1, Math.min(4, w));
-        h = Math.max(1, Math.min(4, h));
+        // 发送倍宽倍高（在 FS S 之前，汉字模式内生效）
+        if (useDW != currentChineseDW) {
+            printer.doubleWidth(useDW);
+            printer.doubleHeight(useDW);
+            currentChineseDW = useDW;
+        }
 
-        printer.send(EscpCommand.setChineseCharacterSize(w, h));
-        currentChineseW = w;
-        currentChineseH = h;
+        printer.send(EscpCommand.setChineseCharacterSize(ss, ss));
+        currentChineseW = ss;
+        currentChineseH = ss;
     }
 
     /** 追踪当前汉字大小，避免冗余 FS S 命令 */
     private int currentChineseW = 1;
     private int currentChineseH = 1;
+    /** 汉字模式下是否已开启倍宽倍高 */
+    private boolean currentChineseDW = false;
 
     /**
      * 汉字字体映射。
@@ -401,22 +493,50 @@ public class WordPrinter {
 
     /**
      * 段落打印后恢复默认样式。
-     * 仅在最后一段或格式变化时才重置，减少冗余命令。
+     * 恢复所有可能被段落修改的格式（加粗/斜体/下划线/字号/倍宽/倍高/行距/CPI）。
      */
     private void resetFormat(WordDocument.WordParagraph wp) throws IOException {
+        // 加粗 → 关闭
         if (wp.isBold()) {
             printer.bold(false);
             currentBold = false;
         }
+        // 斜体 → 关闭
         if (wp.isItalic()) {
             printer.italic(false);
             currentItalic = false;
         }
+        // 下划线 → 关闭
         if (wp.isUnderline()) {
             printer.underlineOff();
             currentUnderline = false;
         }
-        // 字号和倍宽倍高在 applyFontSize 中已按每段设置
+        // 倍宽/倍高 → 关闭（避免残留影响后续段落）
+        if (currentFontSize > 0) {
+            int fontSizePt = currentFontSize;
+            // 检查该字号是否启用了倍宽或倍高
+            final int[][] WIDTH_OPTIONS = {{15,0},{12,0},{10,0},{15,1},{12,1},{10,1}};
+            final int[] WIDTH_PTS = {8,10,12,16,20,24};
+            int idx = 0, bestDiff = Integer.MAX_VALUE;
+            for (int i = 0; i < WIDTH_PTS.length; i++) {
+                int d = Math.abs(fontSizePt - WIDTH_PTS[i]);
+                if (d < bestDiff) { bestDiff = d; idx = i; }
+            }
+            if (WIDTH_OPTIONS[idx][1] == 1) {
+                printer.doubleWidth(false);
+                printer.doubleHeight(false);
+            }
+        }
+        // 行距 → 恢复 1/6" 默认（若被 ESC 3 修改过）
+        if (currentLineSpacingN != 36) {
+            printer.setLineSpacing1_6();
+            currentLineSpacingN = 36;
+        }
+        // CPI → 恢复 10 CPI 默认（若被 applyFontSize 修改过）
+        if (currentCPI > 0 && currentCPI != 10) {
+            printer.select10CPI();
+            currentCPI = 10;
+        }
     }
 
     /** 重置所有格式追踪状态 */
@@ -426,9 +546,12 @@ public class WordPrinter {
         currentUnderline = false;
         currentFont = null;
         currentFontSize = 0;
+        currentCPI = 10;
         currentChineseW = 1;
         currentChineseH = 1;
+        currentChineseDW = false;
         currentChineseFontSize = 0;
+        currentLineSpacingN = 36;
     }
 
     /** 当前汉字字号 (pt)，避免冗余 FS S 命令 */
@@ -438,10 +561,14 @@ public class WordPrinter {
     // 段落间距与缩进（从 Word 段落属性提取并映射到 ESC/P-K）
     // ================================================================
 
+    /** 基础左边界（来自页面配置，ESC l 设置值）。段落缩进在此基础上叠加，默认为 0 */
+    private int baseLeftMargin = 0;
     /** 当前左缩进列数，用于段落后恢复 */
     private int currentLeftIndentCols = 0;
     /** 当前行间距 n/216" 值，避免冗余 ESC 3 命令。默认 36 = 1/6" */
     private int currentLineSpacingN = 36;
+    /** 当前 CPI (10/12/15)，用于段后恢复。默认 10 */
+    private int currentCPI = 10;
 
     /**
      * 段前间距 — ESC J (进纸 n/216 英寸)。
@@ -493,26 +620,27 @@ public class WordPrinter {
 
     /**
      * 左缩进 — ESC l n (设置左边界到第 n 列)。
-     * 段落结束后由 {@link #restoreParagraphIndent} 恢复。
+     * 在页面基础左边界之上叠加段落缩进，段落结束后由 {@link #restoreParagraphIndent} 恢复。
      */
     private void applyParagraphIndent(WordDocument.WordParagraph wp) throws IOException {
         int left = wp.getIndentLeft();
-        if (left > 0) {
-            int cols = twipsToColumns(left, wp.getFontSizePt());
-            if (cols > 0 && cols != currentLeftIndentCols) {
-                printer.send(EscpCommand.setLeftMargin(cols));
-                currentLeftIndentCols = cols;
-            }
+        int indentCols = left > 0 ? twipsToColumns(left, wp.getFontSizePt()) : 0;
+        int targetCols = baseLeftMargin + indentCols;
+        if (targetCols != currentLeftIndentCols) {
+            printer.send(EscpCommand.setLeftMargin(targetCols));
+            currentLeftIndentCols = targetCols;
         }
     }
 
     /**
-     * 恢复段落左缩进。
+     * 恢复段落左缩进 — 重置到页面基础左边界。
      */
     private void restoreParagraphIndent(WordDocument.WordParagraph wp) throws IOException {
-        if (currentLeftIndentCols > 0 && wp.getIndentLeft() > 0) {
-            printer.send(EscpCommand.setLeftMargin(0));
-            currentLeftIndentCols = 0;
+        int indentCols = wp.getIndentLeft() > 0
+                ? twipsToColumns(wp.getIndentLeft(), wp.getFontSizePt()) : 0;
+        if (indentCols > 0 || currentLeftIndentCols != baseLeftMargin) {
+            printer.send(EscpCommand.setLeftMargin(baseLeftMargin));
+            currentLeftIndentCols = baseLeftMargin;
         }
     }
 
@@ -636,6 +764,8 @@ public class WordPrinter {
 
         // 2. 应用配置
         printer.applyConfig(config);
+        this.baseLeftMargin = config.getLeftMargin();  // 段落缩进在此基础上叠加
+        this.currentLeftIndentCols = this.baseLeftMargin;
         resetFormatState();
 
         // 3. 收集需打印的段落
@@ -733,6 +863,38 @@ public class WordPrinter {
         printer.endPhysicalSheet();
     }
 
+    /**
+     * 将 selector 中的页面过滤展开为精确行号过滤。
+     *
+     * <p>通过 {@link WordPageInstance} 获取每页的实际段落列表，
+     * 以全局行号为桥梁映射到白名单行号。
+     */
+    private void resolvePageRanges(PrintSelector selector, WordDocument doc) {
+        if (!selector.hasPageFilter()) return;
+
+        Set<Integer> selectedPages = new LinkedHashSet<>(selector.selectedPages());
+        selector.clearPageFilter();
+
+        // 计算每页的全局行号偏移
+        int lineOffset = 0;
+        Set<Integer> allLines = new LinkedHashSet<>();
+        for (int p = 1; p <= doc.getTotalPages(); p++) {
+            WordPageInstance pi = doc.getPage(p);
+            if (pi == null) break;
+            int paraCount = pi.getParagraphCount();
+            if (selectedPages.contains(p)) {
+                for (int i = 0; i < paraCount; i++) {
+                    allLines.add(lineOffset + i + 1);  // 1-based line numbers
+                }
+            }
+            lineOffset += paraCount;
+        }
+
+        if (!allLines.isEmpty()) {
+            selector.addSelectLines(allLines);
+        }
+    }
+
     /** 日志输出 */
     private void log(String msg) {
         if (verbose) {
@@ -742,5 +904,14 @@ public class WordPrinter {
 
     public void setVerbose(boolean verbose) {
         this.verbose = verbose;
+    }
+
+    /**
+     * 设置基础左边界列数（来自页面配置的左边距）。
+     * 段落级缩进会在此基础之上叠加，避免覆盖页面边距。
+     */
+    public void setBaseLeftMargin(int cols) {
+        this.baseLeftMargin = Math.max(0, cols);
+        this.currentLeftIndentCols = this.baseLeftMargin;
     }
 }

@@ -182,7 +182,7 @@ public class WordPrintTest {
             return;
         }
 
-        WordDocument doc = WordDocument.load(in, 66);
+        WordDocument doc = WordDocument.load(in);
         assertNotNull(doc);
         assertTrue("文档应有段落", doc.getParagraphCount() >= 0);
         assertTrue("总页数 >= 0", doc.getTotalPages() >= 0);

@@ -209,6 +209,35 @@ public final class EscpCommand {
         return bytes(ESC, 'k', n);
     }
 
+    /**
+     * ESC ! n — Master Select，一个字节组合控制多种字体属性。
+     *
+     * <pre>
+     *   bit 0 = 12 CPI (否则 10 CPI)
+     *   bit 1 = 比例打印
+     *   bit 2 = 压缩 (15 CPI)
+     *   bit 3 = 加粗
+     *   bit 4 = 倍高
+     *   bit 5 = 倍宽
+     *   bit 6 = 斜体
+     *   bit 7 = 下划线
+     * </pre>
+     *
+     * <p>示例：
+     * <pre>
+     *   masterSelect(0x00)  正常 10 CPI
+     *   masterSelect(0x01)  12 CPI
+     *   masterSelect(0x08)  加粗
+     *   masterSelect(0x10)  倍高
+     *   masterSelect(0x20)  倍宽
+     *   masterSelect(0x30)  倍宽 + 倍高
+     *   masterSelect(0x38)  倍宽 + 倍高 + 加粗
+     * </pre>
+     */
+    public static byte[] masterSelect(int n) {
+        return bytes(ESC, '!', n);
+    }
+
     /** ESC w n — 倍高开/关 (n=1 开, 0 关) */
     public static byte[] doubleHeight(int on) {
         return bytes(ESC, 'w', on);

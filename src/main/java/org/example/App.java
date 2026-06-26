@@ -4,10 +4,13 @@ import org.example.config.PrintConfig;
 import org.example.connection.JavaxPrintConnection;
 import org.example.connection.PrinterConnection;
 import org.example.preview.PrintPreview;
+import org.example.service.PdfPrinter;
 import org.example.service.PrinterService;
 import org.example.word.PrintJob;
 import org.example.word.PrintSelector;
 import org.example.word.WordDocument;
+import org.example.word.WordPageExporter;
+import org.example.word.WordPageInstance;
 import org.example.word.WordPrinter;
 
 import java.io.IOException;
@@ -31,21 +34,106 @@ public class App {
     // ================================================================
 
     public static void main(String[] args) {
-        PrinterConnection connection = new JavaxPrintConnection(PRINTER_NAME);
-        PrinterService printer = new PrinterService(connection);
         try {
-            printer.open();
-            // 【示例】打印第 1 页，跳过前 2 行并留白进纸
-            printPageSkipWithBlank(printer, DEFAULT_FILE, 1, 0);
-
-        } catch (IOException e) {
-            System.err.println("打印出错: " + e.getMessage());
-        } finally {
-            try {
-                printer.close();  // ★ 关键：close() 才真正提交打印任务
-            } catch (IOException ignored) {
-            }
+            // 测试：提取第 1 页 → 生成新 .docx → 用 Word 打开验证
+            testExportPage(DEFAULT_FILE, 1);
+        } catch (Exception e) {
+            System.err.println("测试出错: " + e.getMessage());
+            e.printStackTrace();
         }
+    }
+
+    // ================================================================
+    // 测试方法
+    // ================================================================
+
+    /**
+     * 测试 WordPageExporter：提取指定页生成新 .docx。
+     * 用 Word 打开输出文件，与原始文档对比确认格式一致。
+     */
+    public static void testExportPage(String filePath, int page) throws Exception {
+        System.out.println("==========================================");
+        System.out.println("  测试：提取第 " + page + " 页 → 新 .docx");
+        System.out.println("  源文件: " + filePath);
+        System.out.println("==========================================");
+
+        // 1. 加载文档
+        WordDocument doc = WordDocument.load(filePath);
+        System.out.println("  文档已加载");
+        System.out.println("    总页数: " + doc.getTotalPages());
+        System.out.println("    总段落: " + doc.getParagraphCount());
+
+        // 2. 打印每页的段落范围（验证分页是否正确）
+        System.out.println("  --- 页面边界 ---");
+        for (int p = 1; p <= doc.getTotalPages(); p++) {
+            WordPageInstance pi = doc.getPage(p);
+            if (pi == null) break;
+            String preview = pi.getParagraphs().isEmpty() ? "(空)"
+                : pi.getParagraphs().get(0).getText();
+            if (preview.length() > 40) preview = preview.substring(0, 37) + "...";
+            System.out.println("    第 " + p + " 页: " + pi.getParagraphCount()
+                    + " 段, 首行=\"" + preview + "\"");
+        }
+
+        // 3. 提取目标页
+        if (page < 1 || page > doc.getTotalPages()) {
+            System.out.println("  ✗ 目标页 " + page + " 不存在!");
+            return;
+        }
+
+        String outputPath = "E:\\tmp\\page" + page + "_exported.docx";
+        WordPageExporter.exportPage(doc, page, outputPath);
+
+        // 4. 验证输出
+        java.io.File outFile = new java.io.File(outputPath);
+        if (outFile.exists()) {
+            System.out.println("\n  ✓ 输出文件: " + outputPath);
+            System.out.println("    大小: " + outFile.length() + " 字节");
+
+            // 用 POI 打开验证
+            WordDocument exported = WordDocument.load(outputPath);
+            System.out.println("    验证加载: " + exported.getParagraphCount() + " 段, "
+                    + exported.getTotalPages() + " 页");
+            System.out.println("\n  请用 Word 打开 \"" + outputPath
+                    + "\" 与原始文档第 " + page + " 页对比。");
+        } else {
+            System.out.println("\n  ✗ 输出文件未生成!");
+        }
+    }
+
+    // ================================================================
+    // PDF 路径打印（推荐：格式与 Word 完全一致）
+    // ================================================================
+
+    /**
+     * 提取 Word 文档的指定页 → 生成新 .docx → LibreOffice 转 PDF → 打印。
+     *
+     * <p>此方法利用 LibreOffice 的排版引擎 + 打印机驱动渲染，
+     * 打印效果与 Word 自带打印功能一致，无任何手工命令偏差。
+     *
+     * @param filePath    Word 文件路径
+     * @param page        目标页码 (1-based)
+     * @param printerName 打印机名称（部分匹配）
+     */
+    public static void printPageViaPdf(String filePath, int page, String printerName)
+            throws Exception {
+        System.out.println("==========================================");
+        System.out.println("  PDF 路径打印 — 第 " + page + " 页");
+        System.out.println("  文件: " + filePath);
+        System.out.println("==========================================");
+
+        // Step 1: 加载文档并分析页面
+        WordDocument doc = WordDocument.load(filePath);
+        System.out.println("  文档: " + doc.getParagraphCount() + " 段落, "
+                + doc.getTotalPages() + " 页");
+
+        // Step 2: 提取目标页 → 新 .docx
+        String tmpDocx = "E:\\tmp\\page" + page + ".docx";
+        WordPageExporter.exportPage(doc, page, tmpDocx);
+        System.out.println("  已导出: " + tmpDocx);
+
+        // Step 3: LibreOffice 转 PDF + 打印
+        PdfPrinter.print(tmpDocx, printerName);
     }
 
     // ================================================================
@@ -65,14 +153,12 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
 
         WordDocument doc = WordDocument.load(filePath);
 
-        // 将页内行号 → 全局行号
-        int pageBase = (page - 1) * doc.getLinesPerPage();
-        int pageStart = pageBase + 1;
-        int pageEnd   = Math.min(pageBase + doc.getLinesPerPage(), doc.getParagraphCount());
+        // 基于文档真实分页符获取页面行范围
+        int pageStart = doc.getPageStartLine(page);
+        int pageEnd   = doc.getPageEndLine(page);
 
         // 跳过前 skipCount 行 → 全局行号
         int[] globalSkips = new int[skipCount];
@@ -88,7 +174,7 @@ public class App {
                 .skipLines(globalSkips);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成! (预计 " + (pageEnd - pageStart + 1 - skipCount) + " 行)");
     }
@@ -109,32 +195,26 @@ public class App {
         System.out.println("  文件: " + filePath);
         System.out.println("==========================================");
 
-        WordDocument doc = WordDocument.load(filePath);
+        // 加载时直接只读取目标页的段落
+        WordDocument doc = WordDocument.loadPage(filePath, page);
 
         // 使用文档页面属性自动生成打印配置
         PrintConfig config = doc.derivePrintConfig();
-        printer.applyConfig(config);
-        System.out.println("  配置: " + config);
 
-        int pageBase = (page - 1) * doc.getLinesPerPage();
-        int pageStart = pageBase + 1;
-        int pageEnd   = Math.min(pageBase + doc.getLinesPerPage(), doc.getParagraphCount());
+        System.out.println("  配置: " + config);
+        System.out.println("  目标页共 " + doc.getParagraphCount() + " 个段落");
 
         int[] skips = new int[skipCount];
         for (int i = 0; i < skipCount; i++) {
-            skips[i] = pageStart + i;
+            skips[i] = i + 1;  // 页内行号 (1-based)
         }
 
-        System.out.println("  页范围: 全局行 " + pageStart + " ~ " + pageEnd);
-        System.out.println("  跳过留白: 全局行 " + pageStart + " ~ " + (pageStart + skipCount - 1));
-
         PrintSelector selector = new PrintSelector()
-                .lineRange(pageStart, pageEnd)
                 .skipLines(skips)
                 .leaveBlank(true);          // ← 关键：跳过时发送 LF 进纸留白
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成! 前 " + skipCount + " 行已留白进纸");
     }
@@ -268,7 +348,6 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
 
         WordDocument doc = WordDocument.load(filePath);
         int totalPages = doc.getTotalPages();
@@ -281,7 +360,7 @@ public class App {
                 .select(1).all("第 1 页 全部正文内容")
                 .build();
 
-        job.execute(printer, doc);
+        job.executeWithConfig(printer, doc, config);
     }
 
     /**
@@ -304,14 +383,14 @@ public class App {
 
         // 1. 配置
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         // 2. 加载文档
         WordDocument doc = WordDocument.load(filePath);
         System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落");
 
-        // 3. 计算目标行的全局行号
-        int globalLine = (page - 1) * doc.getLinesPerPage() + lineOnPage;
+        // 3. 基于文档真实分页符计算目标行的全局行号
+        int globalLine = doc.getPageStartLine(page) + lineOnPage - 1;
         System.out.println("  全局行号: " + globalLine);
 
         // 4. 通过 PrintSelector 精确选中该行
@@ -320,7 +399,7 @@ public class App {
 
         // 5. 打印
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成!");
     }
@@ -350,13 +429,13 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
 
         // 计算该页的起止行号 (全局)
-        int pageStart = (page - 1) * doc.getLinesPerPage() + 1;
-        int pageEnd   = Math.min(page * doc.getLinesPerPage(), doc.getParagraphCount());
+        int pageStart = doc.getPageStartLine(page);
+        int pageEnd   = doc.getPageEndLine(page);
         System.out.println("  页范围: 全局行 " + pageStart + " ~ " + pageEnd
                 + " (共 " + (pageEnd - pageStart + 1) + " 行)");
 
@@ -377,7 +456,7 @@ public class App {
                 .skipEmptyLines(true);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成!");
     }
@@ -398,12 +477,12 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
 
-        int startLine = (page - 1) * doc.getLinesPerPage() + 1;
-        int endLine   = Math.min(page * doc.getLinesPerPage(), doc.getParagraphCount());
+        int startLine = doc.getPageStartLine(page);
+        int endLine   = doc.getPageEndLine(page);
 
         System.out.println("  段落范围: " + startLine + " ~ " + endLine);
 
@@ -411,7 +490,7 @@ public class App {
                 .lineRange(startLine, endLine);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成!");
     }
@@ -432,7 +511,7 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
 
@@ -440,7 +519,7 @@ public class App {
                 .lineRange(line, line);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成!");
     }
@@ -476,7 +555,7 @@ public class App {
 
         // 1. 配置
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         // 2. 加载文档
         WordDocument doc = WordDocument.load(filePath);
@@ -515,7 +594,7 @@ public class App {
 
         // 6. 打印
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成!");
         System.out.println("  已打印: 表格 #" + tableIndex + " 第 " + rowInTable + " 行");
@@ -546,7 +625,7 @@ public class App {
         System.out.println("\n==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
         System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落");
@@ -556,7 +635,7 @@ public class App {
                 .selectLines(lineNumbers);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         System.out.println("\n  打印完成!");
         System.out.println("  已打印: " + lineNumbers.length + " 行 (行号: " + join(lineNumbers) + ")");
@@ -584,7 +663,7 @@ public class App {
         System.out.println("\n==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
 
@@ -594,7 +673,7 @@ public class App {
                 .skipEmptyLines(true);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         int expected = (to - from + 1) - exclude.length;
         System.out.println("\n  打印完成! 预计 " + expected + " 行");
@@ -640,7 +719,7 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
         System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落, "
@@ -671,7 +750,7 @@ public class App {
                 .tableBorder(border);
 
         WordPrinter wordPrinter = new WordPrinter(printer);
-        wordPrinter.print(doc, selector);
+        wordPrinter.print(doc, selector, config);
 
         int count = toRow - fromRow + 1;
         System.out.println("\n  打印完成!");
@@ -724,7 +803,7 @@ public class App {
         System.out.println("==========================================");
 
         PrintConfig config = PrintConfig.defaultConfig();
-        printer.applyConfig(config);
+
 
         WordDocument doc = WordDocument.load(filePath);
         System.out.println("  文档已加载: " + doc.getParagraphCount() + " 段落");

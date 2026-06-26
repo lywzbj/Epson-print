@@ -145,6 +145,18 @@ public class PrinterService {
         send(EscpCommand.doubleWidth(on ? 1 : 0));
     }
 
+    /**
+     * ESC ! n — Master Select，一次命令设置 CPI + 字宽 + 字高 + 加粗 + 斜体 + 下划线。
+     *
+     * <p>与分别调用 selectCPI / bold / doubleWidth / doubleHeight 等价，但只需一条命令，
+     * 效率更高且保证原子性。仅对 ASCII 文本生效，汉字不受影响。
+     *
+     * @param n 属性组合字节，bit0=12CPI, bit3=加粗, bit4=倍高, bit5=倍宽, bit6=斜体, bit7=下划线
+     */
+    public void masterSelect(int n) throws IOException {
+        send(EscpCommand.masterSelect(n));
+    }
+
     // ---- 英文文本 ----
 
     /** 打印一行英文文本（自动添加 CR+LF） */

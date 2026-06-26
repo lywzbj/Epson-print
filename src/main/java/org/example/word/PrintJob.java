@@ -22,12 +22,9 @@ import java.util.*;
  */
 public class PrintJob {
 
-    /** 每页行数（与 WordDocument 默认一致） */
-    private final int linesPerPage;
     private final List<JobRule> rules;
 
-    private PrintJob(int linesPerPage, List<JobRule> rules) {
-        this.linesPerPage = linesPerPage;
+    private PrintJob(List<JobRule> rules) {
         this.rules = new ArrayList<>(rules);
     }
 
@@ -56,7 +53,7 @@ public class PrintJob {
             System.out.println("\n--- 第 " + seg + "/" + rules.size()
                     + " 段: " + rule.getLabel() + " ---");
 
-            PrintSelector selector = rule.toSelector(linesPerPage);
+            PrintSelector selector = rule.toSelector(doc);
             System.out.println("  选择器: " + selector);
 
             wordPrinter.print(doc, selector);
@@ -88,7 +85,7 @@ public class PrintJob {
             System.out.println("\n--- 第 " + seg + "/" + rules.size()
                     + " 段: " + rule.getLabel() + " ---");
 
-            PrintSelector selector = rule.toSelector(linesPerPage);
+            PrintSelector selector = rule.toSelector(doc);
             System.out.println("  选择器: " + selector);
 
             wordPrinter.printWithConfig(doc, selector, config);
@@ -151,27 +148,23 @@ public class PrintJob {
         }
 
         /**
-         * 将页级规则转换为全局 PrintSelector。
+         * 将页级规则转换为全局 PrintSelector（基于 {@link WordPageInstance}）。
          */
-        PrintSelector toSelector(int linesPerPage) {
-            int pageBase = (page - 1) * linesPerPage;  // 该页起始前已跳过的行数
+        PrintSelector toSelector(WordDocument doc) {
+            WordPageInstance pi = doc.getPage(page);
+            if (pi == null) {
+                return new PrintSelector().lineRange(1, 0);  // 空范围
+            }
+
+            int paraCount = pi.getParagraphCount();
 
             if (all) {
-                // 整页：lineRange
-                int start = pageBase + 1;
-                int end = pageBase + linesPerPage;
-                return new PrintSelector().lineRange(start, end);
+                return new PrintSelector().lineRange(1, paraCount);
             }
 
             if (tableIndex != null && tableRows.length > 0) {
-                // 指定表格的某些行
-                int[] globalLines = new int[tableRows.length];
-                // 需要将 "表格内行号" 映射为 "全局行号"。
-                // 表格行也是段落的一部分，在 pageBase 之后顺序排列。
-                // 这里先假设表格行号在页内顺序就是其段落序号（简化处理）。
-                // 实际由 PrintSelector.tableRow/tableRows 按表格元数据精确过滤。
                 PrintSelector s = new PrintSelector()
-                        .lineRange(pageBase + 1, pageBase + linesPerPage)
+                        .lineRange(1, paraCount)
                         .skipNonTable(true)
                         .tableBorder(border);
 
@@ -186,18 +179,12 @@ public class PrintJob {
             }
 
             if (lines.length > 0) {
-                // 页内特定行 → 全局行号
-                int[] globalLines = new int[lines.length];
-                for (int i = 0; i < lines.length; i++) {
-                    globalLines[i] = pageBase + lines[i];
-                }
                 return new PrintSelector()
-                        .lineRange(pageBase + 1, pageBase + linesPerPage)
-                        .selectLines(globalLines);
+                        .lineRange(1, paraCount)
+                        .selectLines(lines);
             }
 
-            // fallback: 整页
-            return new PrintSelector().lineRange(pageBase + 1, pageBase + linesPerPage);
+            return new PrintSelector().lineRange(1, paraCount);
         }
     }
 
@@ -336,7 +323,7 @@ public class PrintJob {
         @Override
         public PrintJob build() {
             flushRule();
-            return new PrintJob(66, rules);
+            return new PrintJob(rules);
         }
 
         private void flushRule() {
